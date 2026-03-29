@@ -12,6 +12,7 @@ import { getGitDiffs } from './git/gitDiffHandle.js';
 import { getGitLogs } from './git/gitLogHandle.js';
 import { calculateMetrics, createMetricsTaskRunner } from './metrics/calculateMetrics.js';
 import { produceOutput } from './packager/produceOutput.js';
+import { filterOutUntrustedFiles } from './security/filterOutUntrustedFiles.js';
 import type { SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
 import { packSkill } from './skill/packSkill.js';
@@ -38,6 +39,7 @@ const defaultDeps = {
   collectFiles,
   processFiles,
   validateFileSafety,
+  filterOutUntrustedFiles,
   produceOutput,
   calculateMetrics,
   createMetricsTaskRunner,
@@ -120,17 +122,32 @@ export const pack = async (
     const rawFiles = collectResults.flatMap((curr) => curr.rawFiles);
     const allSkippedFiles = collectResults.flatMap((curr) => curr.skippedFiles);
 
-    // Run security check and get filtered safe files
-    const { safeFilePaths, safeRawFiles, suspiciousFilesResults, suspiciousGitDiffResults, suspiciousGitLogResults } =
-      await withMemoryLogging('Security Check', () =>
-        deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult),
-      );
+    // Run security check and file processing in parallel using speculative execution.
+    // Security check runs on worker threads (secretlint). File processing runs lightweight
+    // transforms on the main thread by default; when compress/removeComments is enabled,
+    // it uses a separate worker pool. Both paths benefit from the overlap.
+    // In the common case (no suspicious files), the speculative processing result is used directly.
+    // If suspicious files are found (rare), file processing is re-run on the filtered safe subset.
+    progressCallback('Running security check...');
+    const [{ suspiciousFilesResults, suspiciousGitDiffResults, suspiciousGitLogResults }, processedFilesSpeculative] =
+      await Promise.all([
+        withMemoryLogging('Security Check', () =>
+          deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult),
+        ),
+        withMemoryLogging('Process Files', () => deps.processFiles(rawFiles, config, progressCallback)),
+      ]);
 
-    // Process files (remove comments, etc.)
-    progressCallback('Processing files...');
-    const processedFiles = await withMemoryLogging('Process Files', () =>
-      deps.processFiles(safeRawFiles, config, progressCallback),
-    );
+    // Use speculative result if no files were flagged, otherwise re-process safe subset
+    let processedFiles: ProcessedFile[];
+    let safeFilePaths: string[];
+    if (suspiciousFilesResults.length === 0) {
+      processedFiles = processedFilesSpeculative;
+      safeFilePaths = rawFiles.map((file) => file.path);
+    } else {
+      const safeRawFiles = deps.filterOutUntrustedFiles(rawFiles, suspiciousFilesResults);
+      safeFilePaths = safeRawFiles.map((file) => file.path);
+      processedFiles = await deps.processFiles(safeRawFiles, config, progressCallback);
+    }
 
     progressCallback('Generating output...');
 

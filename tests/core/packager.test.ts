@@ -94,7 +94,9 @@ describe('packager', () => {
       undefined,
       undefined,
     );
-    expect(mockDeps.processFiles).toHaveBeenCalledWith(mockSafeRawFiles, mockConfig, progressCallback);
+    // File processing runs speculatively on all raw files (in parallel with security check).
+    // When no suspicious files are found, the speculative result is used directly.
+    expect(mockDeps.processFiles).toHaveBeenCalledWith(mockRawFiles, mockConfig, progressCallback);
     expect(mockDeps.produceOutput).toHaveBeenCalledWith(
       ['root'],
       mockConfig,
