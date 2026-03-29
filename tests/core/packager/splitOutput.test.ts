@@ -72,15 +72,12 @@ describe('packager split output', () => {
       [{ rootLabel: 'root', files: allFilePaths }],
     );
 
-    expect(calculateMetrics).toHaveBeenCalledWith(
-      processedFiles,
-      ['x'.repeat(10), 'x'.repeat(10)],
-      expect.anything(),
-      mockConfig,
-      undefined,
-      undefined,
-      expect.objectContaining({ taskRunner: expect.anything() }),
-    );
+    // Output is passed as a promise to allow overlapping metrics with output generation
+    const metricsCall = calculateMetrics.mock.calls[0];
+    expect(metricsCall[0]).toBe(processedFiles);
+    expect(metricsCall[1]).toBeInstanceOf(Promise);
+    await expect(metricsCall[1]).resolves.toEqual(['x'.repeat(10), 'x'.repeat(10)]);
+    expect(metricsCall[3]).toBe(mockConfig);
 
     expect(result.outputFiles).toEqual(['repomix-output.1.xml', 'repomix-output.2.xml']);
   });

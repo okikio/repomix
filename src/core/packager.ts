@@ -167,8 +167,13 @@ export const pack = async (
       files: filePaths,
     }));
 
-    // Generate and write output (handles both single and split output)
-    const { outputFiles, outputForMetrics } = await deps.produceOutput(
+    // Ensure warm-up task completes before metrics calculation
+    await warmupPromise;
+
+    // Start output generation as a promise (don't await yet).
+    // This allows metrics calculation to begin in parallel on worker threads
+    // while the main thread renders the output template.
+    const outputPromise = deps.produceOutput(
       rootDirs,
       config,
       processedFiles,
@@ -179,14 +184,28 @@ export const pack = async (
       filePathsByRoot,
     );
 
-    // Ensure warm-up task completes before metrics calculation
-    await warmupPromise;
+    // Pass the output content as a promise to calculateMetrics.
+    // File metrics and git metrics start immediately on worker threads,
+    // overlapping with output generation on the main thread.
+    // Output token counting starts once the output promise resolves.
+    const outputForMetricsPromise = outputPromise.then((r) => r.outputForMetrics);
 
-    const metrics = await withMemoryLogging('Calculate Metrics', () =>
-      deps.calculateMetrics(processedFiles, outputForMetrics, progressCallback, config, gitDiffResult, gitLogResult, {
-        taskRunner: metricsTaskRunner,
-      }),
-    );
+    const [{ outputFiles }, metrics] = await Promise.all([
+      outputPromise,
+      withMemoryLogging('Calculate Metrics', () =>
+        deps.calculateMetrics(
+          processedFiles,
+          outputForMetricsPromise,
+          progressCallback,
+          config,
+          gitDiffResult,
+          gitLogResult,
+          {
+            taskRunner: metricsTaskRunner,
+          },
+        ),
+      ),
+    ]);
 
     // Create a result object that includes metrics and security results
     const result = {

@@ -80,4 +80,54 @@ describe('calculateMetrics', () => {
     );
     expect(result).toEqual(aggregatedResult);
   });
+
+  it('should accept output as a Promise and start file metrics before output resolves', async () => {
+    const processedFiles: ProcessedFile[] = [
+      { path: 'file1.txt', content: 'a'.repeat(100) },
+    ];
+    const progressCallback: RepomixProgressCallback = vi.fn();
+
+    const fileMetrics = [{ path: 'file1.txt', charCount: 100, tokenCount: 10 }];
+    (calculateSelectiveFileMetrics as unknown as Mock).mockResolvedValue(fileMetrics);
+
+    const config = createMockConfig();
+
+    // Track call order to verify file metrics starts before output resolves
+    const callOrder: string[] = [];
+    const mockCalculateSelectiveFileMetrics = vi.fn().mockImplementation(async (...args: unknown[]) => {
+      callOrder.push('fileMetrics:start');
+      const result = await (calculateSelectiveFileMetrics as unknown as Mock)(...args);
+      callOrder.push('fileMetrics:end');
+      return result;
+    });
+
+    // Create a promise that resolves after a microtask to simulate async output generation
+    const outputPromise = Promise.resolve().then(() => {
+      callOrder.push('output:resolved');
+      return 'output content';
+    });
+
+    const result = await calculateMetrics(
+      processedFiles,
+      outputPromise,
+      progressCallback,
+      config,
+      undefined,
+      undefined,
+      {
+        calculateSelectiveFileMetrics: mockCalculateSelectiveFileMetrics,
+        calculateOutputMetrics: async () => 15,
+        calculateGitDiffMetrics: () => Promise.resolve(0),
+        calculateGitLogMetrics: () => Promise.resolve({ gitLogTokenCount: 0 }),
+        taskRunner: { run: vi.fn(), cleanup: vi.fn() },
+      },
+    );
+
+    // File metrics should have been called (started before output resolved)
+    expect(mockCalculateSelectiveFileMetrics).toHaveBeenCalled();
+    // Verify file metrics started before output resolved
+    expect(callOrder.indexOf('fileMetrics:start')).toBeLessThan(callOrder.indexOf('output:resolved'));
+    expect(result.totalTokens).toBe(15);
+    expect(result.totalCharacters).toBe('output content'.length);
+  });
 });

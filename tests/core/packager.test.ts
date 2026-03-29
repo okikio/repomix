@@ -105,15 +105,13 @@ describe('packager', () => {
       progressCallback,
       [{ rootLabel: 'root', files: mockFilePaths }],
     );
-    expect(mockDeps.calculateMetrics).toHaveBeenCalledWith(
-      mockProcessedFiles,
-      mockOutput,
-      progressCallback,
-      mockConfig,
-      undefined,
-      undefined,
-      expect.objectContaining({ taskRunner: expect.anything() }),
-    );
+    // Output is passed as a promise to allow overlapping metrics with output generation
+    const calculateMetricsCall = mockDeps.calculateMetrics.mock.calls[0];
+    expect(calculateMetricsCall[0]).toBe(mockProcessedFiles);
+    expect(calculateMetricsCall[1]).toBeInstanceOf(Promise);
+    await expect(calculateMetricsCall[1]).resolves.toBe(mockOutput);
+    expect(calculateMetricsCall[2]).toBe(progressCallback);
+    expect(calculateMetricsCall[3]).toBe(mockConfig);
 
     // Check the result of pack function
     expect(result.totalFiles).toBe(2);
