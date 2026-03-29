@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ProcessedFile } from '../../../src/core/file/fileTypes.js';
 import { calculateSelectiveFileMetrics } from '../../../src/core/metrics/calculateSelectiveFileMetrics.js';
-import { countTokens, type TokenCountTask } from '../../../src/core/metrics/workers/calculateMetricsWorker.js';
+import {
+  countTokens,
+  countTokensBatch,
+  type TokenCountBatchTask,
+  type TokenCountTask,
+} from '../../../src/core/metrics/workers/calculateMetricsWorker.js';
 import type { WorkerOptions } from '../../../src/shared/processConcurrency.js';
 import type { RepomixProgressCallback } from '../../../src/shared/types.js';
 
@@ -13,6 +18,12 @@ const mockInitTaskRunner = <T, R>(_options: WorkerOptions) => {
   return {
     run: async (task: T) => {
       return (await countTokens(task as TokenCountTask)) as R;
+    },
+    runNamed: async <U, V>(name: string, task: U) => {
+      if (name === 'countTokensBatch') {
+        return (await countTokensBatch(task as TokenCountBatchTask)) as V;
+      }
+      throw new Error(`Unknown named function: ${name}`);
     },
     cleanup: async () => {
       // Mock cleanup - no-op for tests

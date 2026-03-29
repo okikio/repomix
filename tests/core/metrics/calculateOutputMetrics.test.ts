@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { calculateOutputMetrics } from '../../../src/core/metrics/calculateOutputMetrics.js';
-import { countTokens, type TokenCountTask } from '../../../src/core/metrics/workers/calculateMetricsWorker.js';
+import {
+  countTokens,
+  countTokensBatch,
+  type TokenCountBatchTask,
+  type TokenCountTask,
+} from '../../../src/core/metrics/workers/calculateMetricsWorker.js';
 import { logger } from '../../../src/shared/logger.js';
 import type { WorkerOptions } from '../../../src/shared/processConcurrency.js';
 
@@ -10,6 +15,12 @@ const mockInitTaskRunner = <T, R>(_options: WorkerOptions) => {
   return {
     run: async (task: T) => {
       return (await countTokens(task as TokenCountTask)) as R;
+    },
+    runNamed: async <U, V>(name: string, task: U) => {
+      if (name === 'countTokensBatch') {
+        return (await countTokensBatch(task as TokenCountBatchTask)) as V;
+      }
+      throw new Error(`Unknown named function: ${name}`);
     },
     cleanup: async () => {
       // Mock cleanup - no-op for tests
@@ -51,9 +62,7 @@ describe('calculateOutputMetrics', () => {
         run: async (_task: T) => {
           throw mockError;
         },
-        cleanup: async () => {
-          // Mock cleanup - no-op for tests
-        },
+        cleanup: async () => {},
       };
     };
 
@@ -89,23 +98,25 @@ describe('calculateOutputMetrics', () => {
     expect(typeof result).toBe('number');
   });
 
-  it('should process large content in parallel', async () => {
+  it('should process large content in parallel using batched tasks', async () => {
     // Generate a large content that exceeds MIN_CONTENT_LENGTH_FOR_PARALLEL
     const content = 'a'.repeat(1_100_000); // 1.1MB of content
     const encoding = 'o200k_base';
     const path = 'large-file.txt';
 
-    let chunksProcessed = 0;
+    let batchesProcessed = 0;
     const mockParallelTaskRunner = <T, R>(_options: WorkerOptions) => {
       return {
         run: async (_task: T) => {
-          chunksProcessed++;
-          // Return a fixed token count for each chunk
-          return 100 as R;
+          return 0 as R;
         },
-        cleanup: async () => {
-          // Mock cleanup - no-op for tests
+        runNamed: async <U, V>(_name: string, task: U) => {
+          batchesProcessed++;
+          const batchTask = task as TokenCountBatchTask;
+          // Return 100 per chunk in the batch
+          return batchTask.contents.map(() => 100) as V;
         },
+        cleanup: async () => {},
       };
     };
 
@@ -113,7 +124,7 @@ describe('calculateOutputMetrics', () => {
       taskRunner: mockParallelTaskRunner({ numOfTasks: 1, workerType: 'calculateMetrics', runtime: 'worker_threads' }),
     });
 
-    expect(chunksProcessed).toBeGreaterThan(1); // Should have processed multiple chunks
+    expect(batchesProcessed).toBeGreaterThan(1); // Should have multiple batches
     expect(result).toBe(100_000); // 1000 chunks * 100 tokens per chunk
   });
 
@@ -127,9 +138,10 @@ describe('calculateOutputMetrics', () => {
         run: async (_task: T) => {
           throw mockError;
         },
-        cleanup: async () => {
-          // Mock cleanup - no-op for tests
+        runNamed: async <_U, _V>(_name: string, _task: _U) => {
+          throw mockError;
         },
+        cleanup: async () => {},
       };
     };
 
@@ -142,21 +154,25 @@ describe('calculateOutputMetrics', () => {
     expect(logger.error).toHaveBeenCalledWith('Error during token count:', mockError);
   });
 
-  it('should correctly split content into chunks for parallel processing', async () => {
+  it('should correctly split content into chunks and batch them for parallel processing', async () => {
     const content = 'a'.repeat(1_100_000); // 1.1MB of content
     const encoding = 'o200k_base';
-    const processedChunks: string[] = [];
+    const allChunks: string[] = [];
 
     const mockChunkTrackingTaskRunner = <T, R>(_options: WorkerOptions) => {
       return {
         run: async (task: T) => {
           const outputTask = task as TokenCountTask;
-          processedChunks.push(outputTask.content);
           return outputTask.content.length as R;
         },
-        cleanup: async () => {
-          // Mock cleanup - no-op for tests
+        runNamed: async <U, V>(_name: string, task: U) => {
+          const batchTask = task as TokenCountBatchTask;
+          for (const chunk of batchTask.contents) {
+            allChunks.push(chunk);
+          }
+          return batchTask.contents.map((c) => c.length) as V;
         },
+        cleanup: async () => {},
       };
     };
 
@@ -168,12 +184,12 @@ describe('calculateOutputMetrics', () => {
       }),
     });
 
-    // Check that chunks are roughly equal in size
-    const _expectedChunkSize = Math.ceil(content.length / 1000); // CHUNK_SIZE is 1000
-    const chunkSizes = processedChunks.map((chunk) => chunk.length);
-
-    expect(processedChunks.length).toBe(1000); // Should have 1000 chunks
-    expect(Math.max(...chunkSizes) - Math.min(...chunkSizes)).toBeLessThanOrEqual(1); // Chunks should be almost equal in size
-    expect(processedChunks.join('')).toBe(content); // All content should be processed
+    // Check that all 1000 chunks were processed across batches
+    expect(allChunks.length).toBe(1000);
+    // Chunks should be roughly equal in size
+    const chunkSizes = allChunks.map((chunk) => chunk.length);
+    expect(Math.max(...chunkSizes) - Math.min(...chunkSizes)).toBeLessThanOrEqual(1);
+    // All content should be processed
+    expect(allChunks.join('')).toBe(content);
   });
 });

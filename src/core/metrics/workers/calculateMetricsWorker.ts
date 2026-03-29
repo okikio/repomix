@@ -20,6 +20,12 @@ export interface TokenCountTask {
   path?: string;
 }
 
+export interface TokenCountBatchTask {
+  contents: string[];
+  encoding: TokenEncoding;
+  paths?: string[];
+}
+
 export const countTokens = async (task: TokenCountTask): Promise<number> => {
   const processStartAt = process.hrtime.bigint();
 
@@ -31,6 +37,26 @@ export const countTokens = async (task: TokenCountTask): Promise<number> => {
     return tokenCount;
   } catch (error) {
     logger.error('Error in token counting worker:', error);
+    throw error;
+  }
+};
+
+/**
+ * Count tokens for multiple contents in a single worker task.
+ * Reduces per-task overhead (message passing, structured cloning, promise resolution)
+ * when processing many small files.
+ */
+export const countTokensBatch = async (task: TokenCountBatchTask): Promise<number[]> => {
+  const processStartAt = process.hrtime.bigint();
+
+  try {
+    const counter = await getTokenCounter(task.encoding);
+    const results = task.contents.map((content, i) => counter.countTokens(content, task.paths?.[i]));
+
+    logger.trace(`Batch counted ${results.length} items. Took: ${getProcessDuration(processStartAt)}ms`);
+    return results;
+  } catch (error) {
+    logger.error('Error in batch token counting worker:', error);
     throw error;
   }
 };
