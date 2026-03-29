@@ -5,26 +5,33 @@ import { describe, expect, it, vi } from 'vitest';
 import type { RawFile } from '../../../src/core/file/fileTypes.js';
 import type { GitDiffResult } from '../../../src/core/git/gitDiffHandle.js';
 import { runSecurityCheck } from '../../../src/core/security/securityCheck.js';
-import type { SecurityCheckTask } from '../../../src/core/security/workers/securityCheckWorker.js';
-import securityCheckWorker from '../../../src/core/security/workers/securityCheckWorker.js';
+import type {
+  SecurityCheckBatchTask,
+  SecurityCheckTask,
+} from '../../../src/core/security/workers/securityCheckWorker.js';
+import securityCheckWorker, { runSecurityCheckBatch } from '../../../src/core/security/workers/securityCheckWorker.js';
 import { logger, repomixLogLevels } from '../../../src/shared/logger.js';
 import type { WorkerOptions } from '../../../src/shared/processConcurrency.js';
 
 vi.mock('../../../src/shared/logger');
-vi.mock('../../../src/shared/processConcurrency', () => ({
-  initWorker: vi.fn(() => ({
-    run: vi.fn().mockImplementation(async (task: SecurityCheckTask) => {
-      return await securityCheckWorker(task);
-    }),
-  })),
-  cleanupWorkerPool: vi.fn(),
-  initTaskRunner: vi.fn(() => ({
-    run: vi.fn().mockImplementation(async (task: SecurityCheckTask) => {
-      return await securityCheckWorker(task);
-    }),
-    cleanup: vi.fn(),
-  })),
-}));
+vi.mock('../../../src/shared/processConcurrency', async () => {
+  const { runSecurityCheckBatch: batchFn } = await import('../../../src/core/security/workers/securityCheckWorker.js');
+  const workerFn = (await import('../../../src/core/security/workers/securityCheckWorker.js')).default;
+  return {
+    initWorker: vi.fn(() => ({
+      run: vi.fn().mockImplementation(async (task: SecurityCheckTask) => workerFn(task)),
+    })),
+    cleanupWorkerPool: vi.fn(),
+    initTaskRunner: vi.fn(() => ({
+      run: vi.fn().mockImplementation(async (task: SecurityCheckTask) => workerFn(task)),
+      runNamed: vi.fn().mockImplementation(async (name: string, task: unknown) => {
+        if (name === 'runSecurityCheckBatch') return batchFn(task as SecurityCheckBatchTask);
+        throw new Error(`Unknown: ${name}`);
+      }),
+      cleanup: vi.fn(),
+    })),
+  };
+});
 
 const mockFiles: RawFile[] = [
   {
@@ -43,6 +50,12 @@ const mockInitTaskRunner = <T, R>(_options: WorkerOptions) => {
   return {
     run: async (task: T) => {
       return (await securityCheckWorker(task as SecurityCheckTask)) as R;
+    },
+    runNamed: async <U, V>(name: string, task: U) => {
+      if (name === 'runSecurityCheckBatch') {
+        return (await runSecurityCheckBatch(task as SecurityCheckBatchTask)) as V;
+      }
+      throw new Error(`Unknown named function: ${name}`);
     },
     cleanup: async () => {
       // Mock cleanup - no-op for tests
@@ -83,9 +96,10 @@ describe('runSecurityCheck', () => {
         run: async () => {
           throw mockError;
         },
-        cleanup: async () => {
-          // Mock cleanup - no-op for tests
+        runNamed: async () => {
+          throw mockError;
         },
+        cleanup: async () => {},
       };
     };
 

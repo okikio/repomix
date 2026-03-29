@@ -1,17 +1,22 @@
 import pc from 'picocolors';
 import { logger } from '../../shared/logger.js';
-import { initTaskRunner } from '../../shared/processConcurrency.js';
+import { initTaskRunner, type TaskRunner } from '../../shared/processConcurrency.js';
 import type { RepomixProgressCallback } from '../../shared/types.js';
 import type { RawFile } from '../file/fileTypes.js';
 import type { GitDiffResult } from '../git/gitDiffHandle.js';
 import type { GitLogResult } from '../git/gitLogHandle.js';
-import type { SecurityCheckTask, SecurityCheckType } from './workers/securityCheckWorker.js';
+import type { SecurityCheckBatchTask, SecurityCheckTask, SecurityCheckType } from './workers/securityCheckWorker.js';
 
 export interface SuspiciousFileResult {
   filePath: string;
   messages: string[];
   type: SecurityCheckType;
 }
+
+// Number of files per batch sent to each worker.
+// Larger batches reduce per-task overhead (message passing, structured cloning, promise resolution)
+// while still distributing work evenly across the pool.
+const FILES_PER_BATCH = 50;
 
 export const runSecurityCheck = async (
   rawFiles: RawFile[],
@@ -21,6 +26,9 @@ export const runSecurityCheck = async (
   deps = {
     initTaskRunner,
   },
+  options: {
+    taskRunner?: TaskRunner<SecurityCheckTask, SuspiciousFileResult | null>;
+  } = {},
 ): Promise<SuspiciousFileResult[]> => {
   const gitDiffTasks: SecurityCheckTask[] = [];
   const gitLogTasks: SecurityCheckTask[] = [];
@@ -55,40 +63,58 @@ export const runSecurityCheck = async (
     }
   }
 
-  const taskRunner = deps.initTaskRunner<SecurityCheckTask, SuspiciousFileResult | null>({
-    numOfTasks: rawFiles.length + gitDiffTasks.length + gitLogTasks.length,
-    workerType: 'securityCheck',
-    runtime: 'worker_threads',
-  });
-  const fileTasks = rawFiles.map(
-    (file) =>
-      ({
-        filePath: file.path,
-        content: file.content,
-        type: 'file',
-      }) satisfies SecurityCheckTask,
-  );
+  // Use pre-created task runner if provided (pool lifecycle managed by caller),
+  // otherwise create a new one.
+  const taskRunner =
+    options.taskRunner ??
+    deps.initTaskRunner<SecurityCheckTask, SuspiciousFileResult | null>({
+      numOfTasks: rawFiles.length + gitDiffTasks.length + gitLogTasks.length,
+      workerType: 'securityCheck',
+      runtime: 'worker_threads',
+    });
+  const ownsTaskRunner = !options.taskRunner;
+
+  const fileTasks: SecurityCheckTask[] = rawFiles.map((file) => ({
+    filePath: file.path,
+    content: file.content,
+    type: 'file',
+  }));
 
   // Combine file tasks, Git diff tasks, and Git log tasks
-  const tasks = [...fileTasks, ...gitDiffTasks, ...gitLogTasks];
+  const allTasks = [...fileTasks, ...gitDiffTasks, ...gitLogTasks];
 
   try {
-    logger.trace(`Starting security check for ${tasks.length} files/content`);
+    logger.trace(`Starting security check for ${allTasks.length} files/content`);
     const startTime = process.hrtime.bigint();
 
-    let completedTasks = 0;
-    const totalTasks = tasks.length;
+    // Batch tasks to reduce per-task overhead. Each batch is sent as a single worker task,
+    // avoiding the message passing and promise resolution overhead of individual tasks.
+    const batches: SecurityCheckTask[][] = [];
+    for (let i = 0; i < allTasks.length; i += FILES_PER_BATCH) {
+      batches.push(allTasks.slice(i, i + FILES_PER_BATCH));
+    }
 
-    const results = await Promise.all(
-      tasks.map((task) =>
-        taskRunner.run(task).then((result) => {
-          completedTasks++;
-          progressCallback(`Running security check... (${completedTasks}/${totalTasks}) ${pc.dim(task.filePath)}`);
-          logger.trace(`Running security check... (${completedTasks}/${totalTasks}) ${task.filePath}`);
-          return result;
-        }),
-      ),
+    let completedFiles = 0;
+    const totalFiles = allTasks.length;
+
+    const batchResults = await Promise.all(
+      batches.map(async (batch) => {
+        const batchResult = await taskRunner.runNamed!<SecurityCheckBatchTask, (SuspiciousFileResult | null)[]>(
+          'runSecurityCheckBatch',
+          { tasks: batch },
+        );
+
+        for (const task of batch) {
+          completedFiles++;
+          progressCallback(`Running security check... (${completedFiles}/${totalFiles}) ${pc.dim(task.filePath)}`);
+          logger.trace(`Running security check... (${completedFiles}/${totalFiles}) ${task.filePath}`);
+        }
+
+        return batchResult;
+      }),
     );
+
+    const results = batchResults.flat();
 
     const endTime = process.hrtime.bigint();
     const duration = Number(endTime - startTime) / 1e6;
@@ -99,7 +125,9 @@ export const runSecurityCheck = async (
     logger.error('Error during security check:', error);
     throw error;
   } finally {
-    // Always cleanup worker pool
-    await taskRunner.cleanup();
+    // Only cleanup worker pool if we created it (not externally managed)
+    if (ownsTaskRunner) {
+      await taskRunner.cleanup();
+    }
   }
 };

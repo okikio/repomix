@@ -87,6 +87,34 @@ export const runSecretLint = async (
   return null;
 };
 
+/**
+ * Process a batch of security check tasks in a single worker invocation.
+ * Reduces per-task overhead (message passing, structured cloning, promise resolution)
+ * by handling multiple files per round-trip.
+ */
+export interface SecurityCheckBatchTask {
+  tasks: SecurityCheckTask[];
+}
+
+export const runSecurityCheckBatch = async (
+  batchTask: SecurityCheckBatchTask,
+): Promise<(SuspiciousFileResult | null)[]> => {
+  const config = cachedConfig;
+  const results: (SuspiciousFileResult | null)[] = [];
+
+  for (const task of batchTask.tasks) {
+    try {
+      const result = await runSecretLint(task.filePath, task.content, task.type, config);
+      results.push(result);
+    } catch (error) {
+      logger.error(`Error checking security on ${task.filePath}:`, error);
+      results.push(null);
+    }
+  }
+
+  return results;
+};
+
 // Export cleanup function for Tinypool teardown (no cleanup needed for this worker)
 export const onWorkerTermination = async (): Promise<void> => {
   // No cleanup needed for security check worker
