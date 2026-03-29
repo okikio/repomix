@@ -111,6 +111,7 @@ describe('packager', () => {
       undefined,
       undefined,
       [{ rootLabel: 'root', files: mockFilePaths }],
+      [],
     );
     expect(mockDeps.writeOutputToDisk).toHaveBeenCalledWith(mockOutput, mockConfig);
     expect(mockDeps.copyToClipboardIfEnabled).toHaveBeenCalledWith(mockOutput, progressCallback, mockConfig);

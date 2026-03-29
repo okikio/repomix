@@ -79,14 +79,13 @@ export const pack = async (
   logMemoryUsage('Pack - Start');
 
   progressCallback('Searching for files...');
-  const filePathsByDir = await withMemoryLogging('Search Files', async () =>
+  const searchResults = await withMemoryLogging('Search Files', async () =>
     Promise.all(
-      rootDirs.map(async (rootDir) => ({
-        rootDir,
-        filePaths: (await deps.searchFiles(rootDir, config, explicitFiles)).filePaths,
-      })),
+      rootDirs.map(async (rootDir) => ({ rootDir, ...(await deps.searchFiles(rootDir, config, explicitFiles)) })),
     ),
   );
+  const filePathsByDir = searchResults.map(({ rootDir, filePaths }) => ({ rootDir, filePaths }));
+  const emptyDirPaths = searchResults.flatMap((r) => r.emptyDirPaths);
 
   // Sort file paths
   progressCallback('Sorting files...');
@@ -178,6 +177,7 @@ export const pack = async (
             gitDiffResult,
             gitLogResult,
             filePathsByRoot,
+            emptyDirPaths,
           );
           // Ensure tiktoken is initialized before submitting metrics tasks
           await warmupPromise;
@@ -249,6 +249,7 @@ export const pack = async (
         gitLogResult,
         progressCallback,
         filePathsByRoot,
+        emptyDirPaths,
       );
       const outputForMetrics = outputPromise.then((r) => r.outputForMetrics);
 
@@ -311,6 +312,7 @@ export const pack = async (
         gitDiffResult,
         gitLogResult,
         filePathsByRoot,
+        emptyDirPaths,
       );
 
       const metricsPromise = withMemoryLogging('Calculate Metrics', () =>
