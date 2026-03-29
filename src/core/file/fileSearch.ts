@@ -189,11 +189,13 @@ export const searchFiles = async (
     logger.debug('[globby] Starting file search...');
     const globbyStartTime = Date.now();
 
-    const filePaths = await globby(includePatterns, {
-      ...createBaseGlobbyOptions(rootDir, config, adjustedIgnorePatterns, ignoreFilePatterns),
+    const baseGlobbyOptions = createBaseGlobbyOptions(rootDir, config, adjustedIgnorePatterns, ignoreFilePatterns);
+
+    // Run file and directory globby in parallel when includeEmptyDirectories is enabled
+    const filePromise = globby(includePatterns, {
+      ...baseGlobbyOptions,
       onlyFiles: true,
     }).catch((error: unknown) => {
-      // Handle EPERM errors specifically
       const code = (error as NodeJS.ErrnoException | { code?: string })?.code;
       if (code === 'EPERM' || code === 'EACCES') {
         throw new PermissionError(
@@ -204,21 +206,18 @@ export const searchFiles = async (
       throw error;
     });
 
+    const dirPromise = config.output.includeEmptyDirectories
+      ? globby(includePatterns, { ...baseGlobbyOptions, onlyDirectories: true })
+      : undefined;
+
+    const [filePaths, directories] = await Promise.all([filePromise, dirPromise]);
+
     const globbyElapsedTime = Date.now() - globbyStartTime;
     logger.debug(`[globby] Completed in ${globbyElapsedTime}ms, found ${filePaths.length} files`);
 
     let emptyDirPaths: string[] = [];
-    if (config.output.includeEmptyDirectories) {
-      logger.debug('[empty dirs] Searching for empty directories...');
-      const emptyDirStartTime = Date.now();
-
-      const directories = await globby(includePatterns, {
-        ...createBaseGlobbyOptions(rootDir, config, adjustedIgnorePatterns, ignoreFilePatterns),
-        onlyDirectories: true,
-      });
-
-      const emptyDirElapsedTime = Date.now() - emptyDirStartTime;
-      logger.debug(`[empty dirs] Found ${directories.length} directories in ${emptyDirElapsedTime}ms`);
+    if (directories) {
+      logger.debug(`[empty dirs] Found ${directories.length} directories`);
 
       const filterStartTime = Date.now();
       emptyDirPaths = await findEmptyDirectories(rootDir, directories, adjustedIgnorePatterns);
