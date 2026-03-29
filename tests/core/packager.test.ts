@@ -55,6 +55,9 @@ describe('packager', () => {
       produceOutput: vi.fn().mockResolvedValue({
         outputForMetrics: mockOutput,
       }),
+      generateOutput: vi.fn().mockResolvedValue(mockOutput),
+      writeOutputToDisk: vi.fn().mockResolvedValue(undefined),
+      copyToClipboardIfEnabled: vi.fn().mockResolvedValue(undefined),
       createMetricsTaskRunner: vi.fn().mockReturnValue({
         run: vi.fn().mockResolvedValue(0),
         cleanup: vi.fn().mockResolvedValue(undefined),
@@ -84,7 +87,6 @@ describe('packager', () => {
     expect(mockDeps.collectFiles).toHaveBeenCalledWith(mockFilePaths, 'root', mockConfig, progressCallback);
     expect(mockDeps.validateFileSafety).toHaveBeenCalled();
     expect(mockDeps.processFiles).toHaveBeenCalled();
-    expect(mockDeps.produceOutput).toHaveBeenCalled();
     expect(mockDeps.calculateMetrics).toHaveBeenCalled();
 
     expect(mockDeps.validateFileSafety).toHaveBeenCalledWith(
@@ -97,21 +99,28 @@ describe('packager', () => {
     // File processing runs speculatively on all raw files (in parallel with security check).
     // When no suspicious files are found, the speculative result is used directly.
     expect(mockDeps.processFiles).toHaveBeenCalledWith(mockRawFiles, mockConfig, progressCallback);
-    expect(mockDeps.produceOutput).toHaveBeenCalledWith(
+
+    // Non-split output: generateOutput is called speculatively (chained from processFiles),
+    // and writeOutputToDisk + copyToClipboardIfEnabled handle the disk write separately.
+    // produceOutput is NOT used for non-split output.
+    expect(mockDeps.generateOutput).toHaveBeenCalledWith(
       ['root'],
       mockConfig,
       mockProcessedFiles,
       mockFilePaths,
       undefined,
       undefined,
-      progressCallback,
       [{ rootLabel: 'root', files: mockFilePaths }],
     );
-    // Output is passed as a promise to allow overlapping metrics with output generation
+    expect(mockDeps.writeOutputToDisk).toHaveBeenCalledWith(mockOutput, mockConfig);
+    expect(mockDeps.copyToClipboardIfEnabled).toHaveBeenCalledWith(mockOutput, progressCallback, mockConfig);
+    expect(mockDeps.produceOutput).not.toHaveBeenCalled();
+
+    // Metrics receives the already-generated output directly (not as a promise)
+    // because output generation completes before metrics starts in the speculative chain
     const calculateMetricsCall = mockDeps.calculateMetrics.mock.calls[0];
     expect(calculateMetricsCall[0]).toBe(mockProcessedFiles);
-    expect(calculateMetricsCall[1]).toBeInstanceOf(Promise);
-    await expect(calculateMetricsCall[1]).resolves.toBe(mockOutput);
+    expect(calculateMetricsCall[1]).toBe(mockOutput);
     expect(calculateMetricsCall[2]).toBe(progressCallback);
     expect(calculateMetricsCall[3]).toBe(mockConfig);
 

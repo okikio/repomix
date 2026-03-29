@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { RepomixConfigMerged } from '../config/configSchema.js';
 import { logMemoryUsage, withMemoryLogging } from '../shared/memoryUtils.js';
+import { getWorkerThreadCount } from '../shared/processConcurrency.js';
 import type { RepomixProgressCallback } from '../shared/types.js';
 import { collectFiles, type SkippedFileInfo } from './file/fileCollect.js';
 import { sortPaths } from './file/filePathSort.js';
@@ -11,7 +12,10 @@ import type { ProcessedFile } from './file/fileTypes.js';
 import { getGitDiffs } from './git/gitDiffHandle.js';
 import { getGitLogs } from './git/gitLogHandle.js';
 import { calculateMetrics, createMetricsTaskRunner } from './metrics/calculateMetrics.js';
+import { generateOutput } from './output/outputGenerate.js';
+import { copyToClipboardIfEnabled } from './packager/copyToClipboardIfEnabled.js';
 import { produceOutput } from './packager/produceOutput.js';
+import { writeOutputToDisk } from './packager/writeOutputToDisk.js';
 import { filterOutUntrustedFiles } from './security/filterOutUntrustedFiles.js';
 import type { SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
@@ -41,6 +45,9 @@ const defaultDeps = {
   validateFileSafety,
   filterOutUntrustedFiles,
   produceOutput,
+  generateOutput,
+  writeOutputToDisk,
+  copyToClipboardIfEnabled,
   calculateMetrics,
   createMetricsTaskRunner,
   sortPaths,
@@ -93,11 +100,16 @@ export const pack = async (
     filePaths: sortedFilePaths.filter((filePath) => filePathSetByDir.get(rootDir)?.has(filePath) ?? false),
   }));
 
-  // Pre-initialize metrics worker pool to overlap tiktoken WASM loading with subsequent pipeline stages
-  // (security check, file processing, output generation). The warm-up task triggers tiktoken
-  // initialization in the worker thread without blocking the main pipeline.
+  // Pre-initialize metrics worker pool and warm up ALL threads to overlap tiktoken initialization
+  // with subsequent pipeline stages (file collection, security check, file processing).
+  // Each thread loads the gpt-tokenizer encoding module (~170ms) on its first task.
+  // By submitting one warmup task per thread, all threads initialize in parallel during
+  // file collection, so they're ready when speculative metrics starts.
   const metricsTaskRunner = deps.createMetricsTaskRunner(allFilePaths.length);
-  const warmupPromise = metricsTaskRunner.run({ content: '', encoding: config.tokenCount.encoding }).catch(() => 0); // Suppress unhandled rejection; errors surface when awaited
+  const warmupTask = { content: '', encoding: config.tokenCount.encoding };
+  const threadCount = getWorkerThreadCount(allFilePaths.length).maxThreads;
+  const warmupPromises = Array.from({ length: threadCount }, () => metricsTaskRunner.run(warmupTask).catch(() => 0));
+  const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
 
   try {
     // Run file collection and git operations in parallel since they are independent:
@@ -129,13 +141,61 @@ export const pack = async (
     // In the common case (no suspicious files), the speculative processing result is used directly.
     // If suspicious files are found (rare), file processing is re-run on the filtered safe subset.
     progressCallback('Running security check...');
+    const securityPromise = withMemoryLogging('Security Check', () =>
+      deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult),
+    );
+    const processPromise = withMemoryLogging('Process Files', () =>
+      deps.processFiles(rawFiles, config, progressCallback),
+    );
+
+    // Build filePathsByRoot for multi-root tree generation
+    // Use directory basename as the label for each root
+    // Fallback to rootDir if basename is empty (e.g., filesystem root "/")
+    const filePathsByRoot: FilesByRoot[] = sortedFilePathsByDir.map(({ rootDir, filePaths }) => ({
+      rootLabel: path.basename(rootDir) || rootDir,
+      files: filePaths,
+    }));
+
+    // Chain speculative output generation and metrics calculation from file processing.
+    // For non-split output: output generation → metrics runs on the metrics worker pool
+    // while security check runs on a separate worker pool. Both proceed in parallel.
+    // This overlaps the entire output generation + metrics pipeline with the security check,
+    // so only the longer of the two determines the stage duration.
+    // For split output mode, fall back to the existing produceOutput flow after security.
+    const isSplitOutput = config.output.splitOutput !== undefined;
+
+    // For non-split output, chain: process → output → metrics (all speculative).
+    // Errors are suppressed here; they re-surface when the promise is awaited in the
+    // common path, or are harmlessly discarded in the rare path (suspicious files found).
+    const speculativeMetricsPromise = !isSplitOutput
+      ? processPromise.then(async (processed) => {
+          progressCallback('Generating output...');
+          const output = await deps.generateOutput(
+            rootDirs,
+            config,
+            processed,
+            allFilePaths,
+            gitDiffResult,
+            gitLogResult,
+            filePathsByRoot,
+          );
+          // Ensure tiktoken is initialized before submitting metrics tasks
+          await warmupPromise;
+          const metricsResult = await withMemoryLogging('Calculate Metrics', () =>
+            deps.calculateMetrics(processed, output, progressCallback, config, gitDiffResult, gitLogResult, {
+              taskRunner: metricsTaskRunner,
+            }),
+          );
+          return { output, metrics: metricsResult };
+        })
+      : undefined;
+
+    // Suppress unhandled rejection for paths that don't await speculativeMetricsPromise
+    // (skill generation, split output, or rare suspicious-files case)
+    speculativeMetricsPromise?.catch(() => {});
+
     const [{ suspiciousFilesResults, suspiciousGitDiffResults, suspiciousGitLogResults }, processedFilesSpeculative] =
-      await Promise.all([
-        withMemoryLogging('Security Check', () =>
-          deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult),
-        ),
-        withMemoryLogging('Process Files', () => deps.processFiles(rawFiles, config, progressCallback)),
-      ]);
+      await Promise.all([securityPromise, processPromise]);
 
     // Use speculative result if no files were flagged, otherwise re-process safe subset
     let processedFiles: ProcessedFile[];
@@ -148,8 +208,6 @@ export const pack = async (
       safeFilePaths = safeRawFiles.map((file) => file.path);
       processedFiles = await deps.processFiles(safeRawFiles, config, progressCallback);
     }
-
-    progressCallback('Generating output...');
 
     // Check if skill generation is requested
     if (config.skillGenerate !== undefined && options.skillDir) {
@@ -176,58 +234,100 @@ export const pack = async (
       return result;
     }
 
-    // Build filePathsByRoot for multi-root tree generation
-    // Use directory basename as the label for each root
-    // Fallback to rootDir if basename is empty (e.g., filesystem root "/")
-    const filePathsByRoot: FilesByRoot[] = sortedFilePathsByDir.map(({ rootDir, filePaths }) => ({
-      rootLabel: path.basename(rootDir) || rootDir,
-      files: filePaths,
-    }));
+    let outputFiles: string[] | undefined;
 
-    // Ensure warm-up task completes before metrics calculation
-    await warmupPromise;
+    if (isSplitOutput) {
+      // Split output mode: use produceOutput for both generation and writing
+      await warmupPromise;
+      progressCallback('Generating output...');
+      const outputPromise = deps.produceOutput(
+        rootDirs,
+        config,
+        processedFiles,
+        allFilePaths,
+        gitDiffResult,
+        gitLogResult,
+        progressCallback,
+        filePathsByRoot,
+      );
+      const outputForMetrics = outputPromise.then((r) => r.outputForMetrics);
 
-    // Start output generation as a promise (don't await yet).
-    // This allows metrics calculation to begin in parallel on worker threads
-    // while the main thread renders the output template.
-    const outputPromise = deps.produceOutput(
-      rootDirs,
-      config,
-      processedFiles,
-      allFilePaths,
-      gitDiffResult,
-      gitLogResult,
-      progressCallback,
-      filePathsByRoot,
-    );
-
-    // Pass the output content as a promise to calculateMetrics.
-    // File metrics and git metrics start immediately on worker threads,
-    // overlapping with output generation on the main thread.
-    // Output token counting starts once the output promise resolves.
-    const outputForMetricsPromise = outputPromise.then((r) => r.outputForMetrics);
-
-    const [{ outputFiles }, metrics] = await Promise.all([
-      outputPromise,
-      withMemoryLogging('Calculate Metrics', () =>
-        deps.calculateMetrics(
-          processedFiles,
-          outputForMetricsPromise,
-          progressCallback,
-          config,
-          gitDiffResult,
-          gitLogResult,
-          {
-            taskRunner: metricsTaskRunner,
-          },
+      const [produceResult, metrics] = await Promise.all([
+        outputPromise,
+        withMemoryLogging('Calculate Metrics', () =>
+          deps.calculateMetrics(
+            processedFiles,
+            outputForMetrics,
+            progressCallback,
+            config,
+            gitDiffResult,
+            gitLogResult,
+            {
+              taskRunner: metricsTaskRunner,
+            },
+          ),
         ),
-      ),
-    ]);
+      ]);
+      outputFiles = produceResult.outputFiles;
 
-    // Create a result object that includes metrics and security results
+      const result = {
+        ...metrics,
+        ...(outputFiles && { outputFiles }),
+        suspiciousFilesResults,
+        suspiciousGitDiffResults,
+        suspiciousGitLogResults,
+        processedFiles,
+        safeFilePaths,
+        skippedFiles: allSkippedFiles,
+      };
+
+      logMemoryUsage('Pack - End');
+      return result;
+    }
+
+    // Non-split output: use speculative metrics if security check passed,
+    // otherwise regenerate output and recalculate metrics.
+    let metrics: Awaited<ReturnType<typeof deps.calculateMetrics>>;
+
+    if (suspiciousFilesResults.length === 0 && speculativeMetricsPromise) {
+      // Common case: speculative results are valid (may already be resolved)
+      const { output, metrics: speculativeMetrics } = await speculativeMetricsPromise;
+
+      // Write output to disk and clipboard
+      progressCallback('Writing output file...');
+      await deps.writeOutputToDisk(output, config);
+      await deps.copyToClipboardIfEnabled(output, progressCallback, config);
+
+      metrics = speculativeMetrics;
+    } else {
+      // Rare case: suspicious files found, regenerate with safe files
+      await warmupPromise;
+      progressCallback('Generating output...');
+      const output = await deps.generateOutput(
+        rootDirs,
+        config,
+        processedFiles,
+        allFilePaths,
+        gitDiffResult,
+        gitLogResult,
+        filePathsByRoot,
+      );
+
+      const metricsPromise = withMemoryLogging('Calculate Metrics', () =>
+        deps.calculateMetrics(processedFiles, output, progressCallback, config, gitDiffResult, gitLogResult, {
+          taskRunner: metricsTaskRunner,
+        }),
+      );
+
+      progressCallback('Writing output file...');
+      await deps.writeOutputToDisk(output, config);
+      await deps.copyToClipboardIfEnabled(output, progressCallback, config);
+
+      metrics = await metricsPromise;
+    }
+
     const result = {
       ...metrics,
-      ...(outputFiles && { outputFiles }),
       suspiciousFilesResults,
       suspiciousGitDiffResults,
       suspiciousGitLogResults,
