@@ -82,9 +82,7 @@ describe('calculateMetrics', () => {
   });
 
   it('should accept output as a Promise and start file metrics before output resolves', async () => {
-    const processedFiles: ProcessedFile[] = [
-      { path: 'file1.txt', content: 'a'.repeat(100) },
-    ];
+    const processedFiles: ProcessedFile[] = [{ path: 'file1.txt', content: 'a'.repeat(100) }];
     const progressCallback: RepomixProgressCallback = vi.fn();
 
     const fileMetrics = [{ path: 'file1.txt', charCount: 100, tokenCount: 10 }];
