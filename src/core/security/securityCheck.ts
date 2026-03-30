@@ -125,9 +125,10 @@ export const runSecurityCheck = async (
     logger.error('Error during security check:', error);
     throw error;
   } finally {
-    // Only cleanup worker pool if we created it (not externally managed)
+    // Only cleanup worker pool if we created it (not externally managed).
+    // Fire-and-forget: all tasks are complete, workers terminate on process exit.
     if (ownsTaskRunner) {
-      await taskRunner.cleanup();
+      taskRunner.cleanup().catch(() => {});
     }
   }
 };

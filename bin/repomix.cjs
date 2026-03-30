@@ -52,12 +52,22 @@ function setupErrorHandlers() {
   process.on('SIGTERM', shutdown);
 }
 
+// Start preloading the heavy packager module graph immediately.
+// The default action path imports the full packager, handlebars, globby, zod, etc.
+// (~160ms of module loading). By starting this import before the CLI framework loads,
+// it runs in parallel with Commander setup and argument parsing, hiding ~100ms of
+// import latency.
+globalThis.__repomixDefaultAction = import('../lib/cli/actions/defaultAction.js');
+
 (async () => {
   try {
     setupErrorHandlers();
 
     const { run } = await import('../lib/cli/cliRun.js');
     await run();
+    // Explicit exit to avoid waiting for worker thread cleanup and event loop drain.
+    // All work is complete and results are written to disk by this point.
+    process.exit(EXIT_CODES.SUCCESS);
   } catch (error) {
     if (error instanceof Error) {
       console.error('Fatal Error:', {

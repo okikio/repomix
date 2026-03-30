@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { RepomixConfigMerged } from '../config/configSchema.js';
 import { logMemoryUsage, withMemoryLogging } from '../shared/memoryUtils.js';
-import { getWorkerThreadCount } from '../shared/processConcurrency.js';
+import { getProcessConcurrency, getWorkerThreadCount } from '../shared/processConcurrency.js';
 import type { RepomixProgressCallback } from '../shared/types.js';
 import { collectFiles, type SkippedFileInfo } from './file/fileCollect.js';
 import { sortPaths } from './file/filePathSort.js';
@@ -80,6 +80,26 @@ export const pack = async (
 
   logMemoryUsage('Pack - Start');
 
+  // Pre-initialize metrics worker pool and start warmup BEFORE searchFiles.
+  // Each worker thread loads the gpt-tokenizer encoding module (~200ms) on its first task.
+  // By starting warmup before search, the CPU-intensive tokenizer initialization overlaps
+  // with the I/O-bound file search (git ls-files, ~75ms) and the beginning of file collection,
+  // reducing the total warmup contention window during file I/O.
+  // Uses getProcessConcurrency() as an upper-bound estimate for thread count since the
+  // actual file count is not yet known. For typical repos (100+ files), this matches the
+  // count that would be computed from allFilePaths.length.
+  // Use processConcurrency * 100 as an upper-bound task estimate to ensure
+  // maxThreads equals processConcurrency (the maximum the pool would ever create).
+  // The TASKS_PER_THREAD threshold in getWorkerThreadCount is 100.
+  const estimatedTasks = getProcessConcurrency() * 100;
+  const metricsTaskRunner = deps.createMetricsTaskRunner(estimatedTasks);
+  const warmupTask = { content: '', encoding: config.tokenCount.encoding };
+  const warmupThreadCount = getWorkerThreadCount(estimatedTasks).maxThreads;
+  const warmupPromises = Array.from({ length: warmupThreadCount }, () =>
+    metricsTaskRunner.run(warmupTask).catch(() => 0),
+  );
+  const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
+
   progressCallback('Searching for files...');
   const searchResults = await withMemoryLogging('Search Files', async () =>
     Promise.all(
@@ -100,17 +120,6 @@ export const pack = async (
     rootDir,
     filePaths: sortedFilePaths.filter((filePath) => filePathSetByDir.get(rootDir)?.has(filePath) ?? false),
   }));
-
-  // Pre-initialize metrics worker pool and warm up ALL threads to overlap tiktoken initialization
-  // with subsequent pipeline stages (file collection, security check, file processing).
-  // Each thread loads the gpt-tokenizer encoding module (~170ms) on its first task.
-  // By submitting one warmup task per thread, all threads initialize in parallel during
-  // file collection, so they're ready when speculative metrics starts.
-  const metricsTaskRunner = deps.createMetricsTaskRunner(allFilePaths.length);
-  const warmupTask = { content: '', encoding: config.tokenCount.encoding };
-  const threadCount = getWorkerThreadCount(allFilePaths.length).maxThreads;
-  const warmupPromises = Array.from({ length: threadCount }, () => metricsTaskRunner.run(warmupTask).catch(() => 0));
-  const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
 
   try {
     // Run file collection, git operations, and sort data prefetch in parallel since
@@ -353,6 +362,9 @@ export const pack = async (
 
     return result;
   } finally {
-    await metricsTaskRunner.cleanup();
+    // Fire-and-forget: don't block pack() return on worker termination.
+    // All tasks are complete; workers will be terminated when the process exits.
+    // This saves ~70ms that pool.destroy() spends signaling worker threads.
+    metricsTaskRunner.cleanup().catch(() => {});
   }
 };

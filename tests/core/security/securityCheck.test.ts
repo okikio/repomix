@@ -28,7 +28,7 @@ vi.mock('../../../src/shared/processConcurrency', async () => {
         if (name === 'runSecurityCheckBatch') return batchFn(task as SecurityCheckBatchTask);
         throw new Error(`Unknown: ${name}`);
       }),
-      cleanup: vi.fn(),
+      cleanup: vi.fn().mockResolvedValue(undefined),
     })),
   };
 });

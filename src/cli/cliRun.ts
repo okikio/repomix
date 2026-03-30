@@ -286,6 +286,12 @@ export const runCli = async (directories: string[], cwd: string, options: CliOpt
     return await runRemoteAction(directories[0], options);
   }
 
-  const { runDefaultAction } = await import('./actions/defaultAction.js');
+  // Use preloaded module from entry point if available, otherwise import normally.
+  // The CJS entry point starts loading defaultAction.js in parallel with cliRun.js,
+  // overlapping ~100ms of module loading with CLI framework initialization.
+  const preloaded = (globalThis as Record<string, unknown>).__repomixDefaultAction as
+    | Promise<typeof import('./actions/defaultAction.js')>
+    | undefined;
+  const { runDefaultAction } = await (preloaded ?? import('./actions/defaultAction.js'));
   return await runDefaultAction(directories, cwd, options);
 };
