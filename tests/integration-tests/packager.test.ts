@@ -119,6 +119,12 @@ describe.runIf(!isWindows)('packager integration', () => {
           run: async () => 0,
           cleanup: async () => {},
         }),
+        createSecurityTaskRunner: () =>
+          ({
+            run: async () => null,
+            runNamed: async () => [],
+            cleanup: async () => {},
+          }) as ReturnType<typeof import('../../src/core/security/securityCheck.js')['createSecurityTaskRunner']>,
         calculateMetrics: async (
           processedFiles,
           _output,

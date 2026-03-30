@@ -62,6 +62,11 @@ describe('packager', () => {
         run: vi.fn().mockResolvedValue(0),
         cleanup: vi.fn().mockResolvedValue(undefined),
       }),
+      createSecurityTaskRunner: vi.fn().mockReturnValue({
+        run: vi.fn().mockResolvedValue(null),
+        runNamed: vi.fn().mockResolvedValue([]),
+        cleanup: vi.fn().mockResolvedValue(undefined),
+      }),
       prefetchFileChangeCounts: vi.fn().mockResolvedValue(undefined),
       calculateMetrics: vi.fn().mockResolvedValue({
         totalFiles: 2,
@@ -96,6 +101,8 @@ describe('packager', () => {
       mockConfig,
       undefined,
       undefined,
+      undefined,
+      { taskRunner: expect.anything() },
     );
     // File processing runs speculatively on all raw files (in parallel with security check).
     // When no suspicious files are found, the speculative result is used directly.

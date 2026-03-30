@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { RepomixConfigMerged } from '../config/configSchema.js';
+import { logger } from '../shared/logger.js';
 import { logMemoryUsage, withMemoryLogging } from '../shared/memoryUtils.js';
 import { getProcessConcurrency, getWorkerThreadCount } from '../shared/processConcurrency.js';
 import type { RepomixProgressCallback } from '../shared/types.js';
@@ -16,7 +17,7 @@ import { prefetchFileChangeCounts } from './output/outputSort.js';
 import { copyToClipboardIfEnabled } from './packager/copyToClipboardIfEnabled.js';
 import { writeOutputToDisk } from './packager/writeOutputToDisk.js';
 import { filterOutUntrustedFiles } from './security/filterOutUntrustedFiles.js';
-import type { SuspiciousFileResult } from './security/securityCheck.js';
+import { createSecurityTaskRunner, type SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
 
 // Lazy-load output generation modules to reduce startup critical path.
@@ -53,6 +54,7 @@ const defaultDeps = {
   processFiles,
   validateFileSafety,
   filterOutUntrustedFiles,
+  createSecurityTaskRunner,
   produceOutput: null as ProduceOutputFn | null,
   generateOutput: null as GenerateOutputFn | null,
   writeOutputToDisk,
@@ -138,6 +140,19 @@ export const pack = async (
   );
   const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
 
+  // Pre-initialize security worker pool and warm up secretlint BEFORE searchFiles.
+  // The secretlint module + rule preset loading on the worker thread takes ~150-200ms.
+  // By creating the pool and sending a warmup task here, this cold start overlaps with
+  // the I/O-bound file search (git ls-files, ~75ms) and file collection (~120ms),
+  // so the worker is already initialized when real security tasks arrive after collection.
+  // Without this, the cold start happens sequentially on the critical path after collectFiles.
+  const securityTaskRunner = config.security.enableSecurityCheck ? deps.createSecurityTaskRunner() : null;
+  if (securityTaskRunner) {
+    securityTaskRunner.run({ filePath: '', content: '', type: 'file' as const }).catch((error) => {
+      logger.debug('Security worker warmup failed (non-fatal):', error);
+    });
+  }
+
   // Start git operations early so they overlap with searchFiles and sort,
   // completing before collectFiles begins. Previously, git ops ran in parallel
   // with collectFiles, causing I/O contention between git subprocesses (diff,
@@ -205,7 +220,9 @@ export const pack = async (
     // If suspicious files are found (rare), file processing is re-run on the filtered safe subset.
     progressCallback('Running security check...');
     const securityPromise = withMemoryLogging('Security Check', () =>
-      deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult),
+      deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult, undefined, {
+        taskRunner: securityTaskRunner ?? undefined,
+      }),
     );
     const processPromise = withMemoryLogging('Process Files', () =>
       deps.processFiles(rawFiles, config, progressCallback),
@@ -485,5 +502,6 @@ export const pack = async (
     // All tasks are complete; workers will be terminated when the process exits.
     // This saves ~70ms that pool.destroy() spends signaling worker threads.
     metricsTaskRunner.cleanup().catch(() => {});
+    securityTaskRunner?.cleanup().catch(() => {});
   }
 };

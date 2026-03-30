@@ -75,6 +75,11 @@ index 123..456 100644
       run: vi.fn().mockResolvedValue(0),
       cleanup: vi.fn().mockResolvedValue(undefined),
     });
+    const mockCreateSecurityTaskRunner = vi.fn().mockReturnValue({
+      run: vi.fn().mockResolvedValue(null),
+      runNamed: vi.fn().mockResolvedValue([]),
+      cleanup: vi.fn().mockResolvedValue(undefined),
+    });
 
     // Config with diffs disabled
     if (mockConfig.output.git) {
@@ -92,6 +97,7 @@ index 123..456 100644
       copyToClipboardIfEnabled: vi.fn().mockResolvedValue(undefined),
       calculateMetrics: mockCalculateMetrics,
       createMetricsTaskRunner: mockCreateMetricsTaskRunner,
+      createSecurityTaskRunner: mockCreateSecurityTaskRunner,
       sortPaths: mockSortPaths,
     });
 
@@ -133,6 +139,11 @@ index 123..456 100644
       run: vi.fn().mockResolvedValue(0),
       cleanup: vi.fn().mockResolvedValue(undefined),
     });
+    const mockCreateSecurityTaskRunner = vi.fn().mockReturnValue({
+      run: vi.fn().mockResolvedValue(null),
+      runNamed: vi.fn().mockResolvedValue([]),
+      cleanup: vi.fn().mockResolvedValue(undefined),
+    });
 
     // Config with diffs enabled
     if (mockConfig.output.git) {
@@ -150,6 +161,7 @@ index 123..456 100644
       copyToClipboardIfEnabled: vi.fn().mockResolvedValue(undefined),
       calculateMetrics: mockCalculateMetrics,
       createMetricsTaskRunner: mockCreateMetricsTaskRunner,
+      createSecurityTaskRunner: mockCreateSecurityTaskRunner,
       sortPaths: mockSortPaths,
     });
 

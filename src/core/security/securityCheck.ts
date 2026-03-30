@@ -28,6 +28,22 @@ const FILES_PER_BATCH = 50;
 // the pipeline's tolerance.
 const SECURITY_MAX_TASKS_FOR_THREAD_CALC = 100;
 
+/**
+ * Create a security check task runner (Tinypool with secretlint worker).
+ * Exported so packager.ts can pre-create and warm up the pool before searchFiles,
+ * overlapping the expensive secretlint module initialization (~150-200ms) with
+ * the I/O-bound file search and collection phases.
+ */
+export const createSecurityTaskRunner = (
+  deps = { initTaskRunner },
+): TaskRunner<SecurityCheckTask, SuspiciousFileResult | null> => {
+  return deps.initTaskRunner<SecurityCheckTask, SuspiciousFileResult | null>({
+    numOfTasks: SECURITY_MAX_TASKS_FOR_THREAD_CALC,
+    workerType: 'securityCheck',
+    runtime: 'worker_threads',
+  });
+};
+
 export const runSecurityCheck = async (
   rawFiles: RawFile[],
   progressCallback: RepomixProgressCallback = () => {},

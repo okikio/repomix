@@ -27,7 +27,9 @@ describe('validateFileSafety', () => {
 
     const result = await validateFileSafety(rawFiles, progressCallback, config, undefined, undefined, deps);
 
-    expect(deps.runSecurityCheck).toHaveBeenCalledWith(rawFiles, progressCallback, undefined, undefined);
+    expect(deps.runSecurityCheck).toHaveBeenCalledWith(rawFiles, progressCallback, undefined, undefined, undefined, {
+      taskRunner: undefined,
+    });
     expect(deps.filterOutUntrustedFiles).toHaveBeenCalledWith(rawFiles, suspiciousFilesResults);
     expect(result).toEqual({
       safeRawFiles,
@@ -35,6 +37,31 @@ describe('validateFileSafety', () => {
       suspiciousFilesResults,
       suspiciousGitDiffResults: [],
       suspiciousGitLogResults: [],
+    });
+  });
+
+  it('should forward pre-created task runner to runSecurityCheck', async () => {
+    const rawFiles: RawFile[] = [{ path: 'file1.txt', content: 'content1' }];
+    const config: RepomixConfigMerged = {
+      security: { enableSecurityCheck: true },
+    } as RepomixConfigMerged;
+    const progressCallback: RepomixProgressCallback = vi.fn();
+    const mockTaskRunner = {
+      run: vi.fn().mockResolvedValue(null),
+      runNamed: vi.fn().mockResolvedValue([]),
+      cleanup: vi.fn().mockResolvedValue(undefined),
+    };
+    const deps = {
+      runSecurityCheck: vi.fn().mockResolvedValue([]),
+      filterOutUntrustedFiles: vi.fn().mockReturnValue(rawFiles),
+    };
+
+    await validateFileSafety(rawFiles, progressCallback, config, undefined, undefined, deps, {
+      taskRunner: mockTaskRunner as never,
+    });
+
+    expect(deps.runSecurityCheck).toHaveBeenCalledWith(rawFiles, progressCallback, undefined, undefined, undefined, {
+      taskRunner: mockTaskRunner,
     });
   });
 });
