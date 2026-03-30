@@ -11,6 +11,61 @@ const GIT_REMOTE_TIMEOUT = 30000;
 const gitRemoteEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
 const gitRemoteOpts = { timeout: GIT_REMOTE_TIMEOUT, env: gitRemoteEnv };
 
+/**
+ * List tracked files using git ls-tree (excludes submodules and directory entries)
+ * and untracked files using git ls-files -o (respects .gitignore).
+ * Returns file paths as an array.
+ *
+ * Uses -z flag for NUL-terminated output to correctly handle filenames
+ * with special characters (spaces, non-ASCII, quotes).
+ */
+export const execGitLsFiles = async (
+  directory: string,
+  deps = {
+    execFileAsync,
+  },
+): Promise<string[]> => {
+  try {
+    // Run both commands in parallel for speed:
+    // - ls-tree: tracked files with mode info (to filter out symlinks/submodules)
+    // - ls-files -o: untracked files respecting .gitignore
+    // Both use -z for NUL-terminated output (avoids quoting of special characters)
+    const [tracked, untracked] = await Promise.all([
+      deps.execFileAsync('git', ['-C', directory, 'ls-tree', '-r', '-z', 'HEAD'], {
+        maxBuffer: 50 * 1024 * 1024,
+      }),
+      deps.execFileAsync('git', ['-C', directory, 'ls-files', '-z', '-o', '--exclude-standard'], {
+        maxBuffer: 50 * 1024 * 1024,
+      }),
+    ]);
+
+    // Parse ls-tree -z output (NUL-separated entries: "mode type hash\tpath\0")
+    // Filter to only regular files (mode 100644/100755), excluding:
+    // - symlinks (120000)
+    // - submodules/gitlinks (160000)
+    const allFiles: string[] = [];
+    for (const entry of (tracked.stdout || '').split('\0')) {
+      if (!entry) continue;
+      const tabIdx = entry.indexOf('\t');
+      if (tabIdx === -1) continue;
+      const mode = entry.slice(0, 6);
+      if (mode === '100644' || mode === '100755') {
+        allFiles.push(entry.slice(tabIdx + 1));
+      }
+    }
+
+    // Parse ls-files -z output (NUL-separated paths)
+    for (const entry of (untracked.stdout || '').split('\0')) {
+      if (entry) allFiles.push(entry);
+    }
+
+    return allFiles;
+  } catch (error) {
+    logger.trace('Failed to execute git ls-files:', (error as Error).message);
+    throw error;
+  }
+};
+
 export const execGitLogFilenames = async (
   directory: string,
   maxCommits = 100,
