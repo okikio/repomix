@@ -12,15 +12,23 @@ import type { ProcessedFile } from './file/fileTypes.js';
 import { getGitDiffs } from './git/gitDiffHandle.js';
 import { getGitLogs } from './git/gitLogHandle.js';
 import { calculateMetrics, createMetricsTaskRunner } from './metrics/calculateMetrics.js';
-import { generateOutput } from './output/outputGenerate.js';
 import { prefetchFileChangeCounts } from './output/outputSort.js';
 import { copyToClipboardIfEnabled } from './packager/copyToClipboardIfEnabled.js';
-import { produceOutput } from './packager/produceOutput.js';
 import { writeOutputToDisk } from './packager/writeOutputToDisk.js';
 import { filterOutUntrustedFiles } from './security/filterOutUntrustedFiles.js';
 import type { SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
-import { packSkill } from './skill/packSkill.js';
+
+// Lazy-load output generation modules to reduce startup critical path.
+// These modules import Handlebars (~25ms), template styles (~15ms), and other
+// output-specific dependencies that are not needed until output generation begins.
+// By deferring them from the static import graph, the defaultAction module preload
+// completes ~40ms faster, eliminating the gap between cliRun and the preload.
+// The dynamic import starts at the beginning of pack() and overlaps with searchFiles
+// (~75ms) and collectFiles (~230ms), hiding the ~40ms import cost entirely.
+type GenerateOutputFn = typeof import('./output/outputGenerate.js')['generateOutput'];
+type ProduceOutputFn = typeof import('./packager/produceOutput.js')['produceOutput'];
+type PackSkillFn = typeof import('./skill/packSkill.js')['packSkill'];
 
 export interface PackResult {
   totalFiles: number;
@@ -45,8 +53,8 @@ const defaultDeps = {
   processFiles,
   validateFileSafety,
   filterOutUntrustedFiles,
-  produceOutput,
-  generateOutput,
+  produceOutput: null as ProduceOutputFn | null,
+  generateOutput: null as GenerateOutputFn | null,
   writeOutputToDisk,
   copyToClipboardIfEnabled,
   calculateMetrics,
@@ -54,7 +62,7 @@ const defaultDeps = {
   sortPaths,
   getGitDiffs,
   getGitLogs,
-  packSkill,
+  packSkill: null as PackSkillFn | null,
   prefetchFileChangeCounts,
 };
 
@@ -79,6 +87,25 @@ export const pack = async (
   };
 
   logMemoryUsage('Pack - Start');
+
+  // Lazy-load output generation modules (Handlebars, templates, etc.) during I/O-bound phases.
+  // These modules add ~40ms to the static import graph that would otherwise block the
+  // defaultAction preload at startup. By deferring them to a dynamic import here, the
+  // preload completes faster and the import overlaps with searchFiles and collectFiles I/O.
+  // When all three output deps are provided via overrideDeps (tests), the import is skipped.
+  const needsOutputModules = !deps.generateOutput || !deps.produceOutput || !deps.packSkill;
+  const outputModulePromise = needsOutputModules
+    ? Promise.all([
+        import('./output/outputGenerate.js'),
+        import('./packager/produceOutput.js'),
+        import('./skill/packSkill.js'),
+      ]).then(([outputGenMod, produceOutputMod, packSkillMod]) => {
+        // Only set deps that weren't provided by overrideDeps (e.g., test mocks)
+        if (!deps.generateOutput) deps.generateOutput = outputGenMod.generateOutput;
+        if (!deps.produceOutput) deps.produceOutput = produceOutputMod.produceOutput;
+        if (!deps.packSkill) deps.packSkill = packSkillMod.packSkill;
+      })
+    : null;
 
   // Pre-initialize metrics worker pool and start warmup BEFORE searchFiles.
   // Each worker thread loads the gpt-tokenizer encoding module (~200ms) on its first task.
@@ -214,8 +241,10 @@ export const pack = async (
       // Chain from processPromise: generate output, then start metrics with output as a promise
       speculativeOutputPromise = processPromise.then(async (processed) => {
         await warmupPromise;
+        if (outputModulePromise) await outputModulePromise;
         progressCallback('Generating output...');
-        return deps.generateOutput(
+        // deps.generateOutput is guaranteed set after outputModulePromise resolves
+        return (deps.generateOutput as NonNullable<typeof deps.generateOutput>)(
           rootDirs,
           config,
           processed,
@@ -234,7 +263,7 @@ export const pack = async (
         return withMemoryLogging('Calculate Metrics', () =>
           deps.calculateMetrics(
             processed,
-            speculativeOutputPromise!,
+            speculativeOutputPromise as Promise<string>,
             progressCallback,
             config,
             gitDiffResult,
@@ -299,8 +328,9 @@ export const pack = async (
     if (config.skillGenerate !== undefined && options.skillDir) {
       // Await warmup to ensure graceful worker shutdown (avoid terminating WASM-loading thread)
       await warmupPromise;
+      if (outputModulePromise) await outputModulePromise;
 
-      const result = await deps.packSkill({
+      const result = await (deps.packSkill as NonNullable<typeof deps.packSkill>)({
         rootDirs,
         config,
         options,
@@ -325,8 +355,9 @@ export const pack = async (
     if (isSplitOutput) {
       // Split output mode: use produceOutput for both generation and writing
       await warmupPromise;
+      if (outputModulePromise) await outputModulePromise;
       progressCallback('Generating output...');
-      const outputPromise = deps.produceOutput(
+      const outputPromise = (deps.produceOutput as NonNullable<typeof deps.produceOutput>)(
         rootDirs,
         config,
         processedFiles,
@@ -402,8 +433,9 @@ export const pack = async (
     } else {
       // Rare case: suspicious files found, regenerate with safe files
       await warmupPromise;
+      if (outputModulePromise) await outputModulePromise;
       progressCallback('Generating output...');
-      const output = await deps.generateOutput(
+      const output = await (deps.generateOutput as NonNullable<typeof deps.generateOutput>)(
         rootDirs,
         config,
         processedFiles,

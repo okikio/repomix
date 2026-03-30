@@ -9,13 +9,11 @@ import {
 } from '../../config/configSchema.js';
 import { readFilePathsFromStdin } from '../../core/file/fileStdin.js';
 import { type PackResult, pack } from '../../core/packager.js';
-import { generateDefaultSkillName } from '../../core/skill/skillUtils.js';
 import { RepomixError, rethrowValidationErrorIfZodError } from '../../shared/errorHandle.js';
 import { logger } from '../../shared/logger.js';
 import { splitPatterns } from '../../shared/patternUtils.js';
 import { reportResults } from '../cliReport.js';
 import { Spinner } from '../cliSpinner.js';
-import { promptSkillLocation, resolveAndPrepareSkillDir } from '../prompts/skillPrompts.js';
 import type { CliOptions } from '../types.js';
 import { runMigrationAction } from './migrationAction.js';
 
@@ -66,6 +64,14 @@ export const runDefaultAction = async (
 
   // Validate skill generation options and prompt for location
   if (config.skillGenerate !== undefined) {
+    // Lazy-load skill modules only when skill generation is requested.
+    // skillPrompts imports @clack/prompts and other heavy deps (~36ms) that are
+    // not needed on the common CLI execution path.
+    const [{ generateDefaultSkillName }, { promptSkillLocation, resolveAndPrepareSkillDir }] = await Promise.all([
+      import('../../core/skill/skillUtils.js'),
+      import('../prompts/skillPrompts.js'),
+    ]);
+
     // Resolve skill name: use pre-computed name (from remoteAction) or generate from directory
     cliOptions.skillName ??=
       typeof config.skillGenerate === 'string'
