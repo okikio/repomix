@@ -114,6 +114,7 @@ describe.runIf(!isWindows)('packager integration', () => {
             filterOutUntrustedFiles,
           });
         },
+        runSecurityCheck: async () => [],
         produceOutput,
         createMetricsTaskRunner: () => ({
           run: async () => 0,

@@ -42,7 +42,10 @@ describe('packager split output', () => {
     const result = await pack(['root'], mockConfig, () => {}, {
       searchFiles: vi.fn().mockResolvedValue({ filePaths: allFilePaths, emptyDirPaths: [] }),
       sortPaths: vi.fn().mockImplementation((paths) => paths),
-      collectFiles: vi.fn().mockResolvedValue({ rawFiles: processedFiles, skippedFiles: [] }),
+      collectFiles: vi
+        .fn()
+        .mockResolvedValueOnce({ rawFiles: [processedFiles[0]], skippedFiles: [] })
+        .mockResolvedValueOnce({ rawFiles: [processedFiles[1]], skippedFiles: [] }),
       processFiles: vi.fn().mockReturnValue(processedFiles),
       validateFileSafety: vi.fn().mockResolvedValue({
         safeFilePaths: allFilePaths,
@@ -51,6 +54,7 @@ describe('packager split output', () => {
         suspiciousGitDiffResults: [],
         suspiciousGitLogResults: [],
       }),
+      runSecurityCheck: vi.fn().mockResolvedValue([]),
       getGitDiffs: vi.fn().mockResolvedValue(undefined),
       getGitLogs: vi.fn().mockResolvedValue(undefined),
       produceOutput,

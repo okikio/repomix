@@ -17,7 +17,7 @@ import { prefetchFileChangeCounts } from './output/outputSort.js';
 import { copyToClipboardIfEnabled } from './packager/copyToClipboardIfEnabled.js';
 import { writeOutputToDisk } from './packager/writeOutputToDisk.js';
 import { filterOutUntrustedFiles } from './security/filterOutUntrustedFiles.js';
-import { createSecurityTaskRunner, type SuspiciousFileResult } from './security/securityCheck.js';
+import { createSecurityTaskRunner, runSecurityCheck, type SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
 
 // Lazy-load output generation modules to reduce startup critical path.
@@ -55,6 +55,7 @@ const defaultDeps = {
   validateFileSafety,
   filterOutUntrustedFiles,
   createSecurityTaskRunner,
+  runSecurityCheck,
   produceOutput: null as ProduceOutputFn | null,
   generateOutput: null as GenerateOutputFn | null,
   writeOutputToDisk,
@@ -194,40 +195,115 @@ export const pack = async (
   }));
 
   try {
-    // Run file collection without git operations competing for I/O.
-    // Git diff/log/prefetch started above overlap with searchFiles + sort and are
-    // typically already resolved by the time collectFiles begins, eliminating the
-    // I/O contention that previously inflated file reading latency.
+    // Pipeline file collection with security checking to reduce critical path latency.
+    // Previously, security only started after ALL files were collected, creating a
+    // sequential dependency: collectFiles(149ms) → security(224ms). By splitting
+    // collection into two stages, the security worker begins processing the first batch
+    // while the second batch is still being read from disk.
+    //
+    // Timeline (4-core, ~1000 files):
+    //   Before: ──[collect 149ms]──[security 224ms]──
+    //   After:  ──[collect½ 75ms]──[security starts]──────────────────
+    //                              ──[collect½ 75ms]──[process+output]──
+    //
+    // This gives security a ~75ms head start, reducing the critical path by that amount.
     progressCallback('Collecting files...');
-    const [collectResults, gitDiffResult, gitLogResult] = await Promise.all([
-      withMemoryLogging(
-        'Collect Files',
-        async () =>
-          await Promise.all(
-            sortedFilePathsByDir.map(({ rootDir, filePaths }) =>
-              deps.collectFiles(filePaths, rootDir, config, progressCallback),
-            ),
-          ),
+
+    // Await git operations (started before searchFiles, should already be resolved)
+    const [gitDiffResult, gitLogResult] = await Promise.all([gitDiffPromise, gitLogPromise, prefetchPromise]);
+
+    // Split file paths into two halves for pipelined collection+security
+    const firstHalfByDir = sortedFilePathsByDir.map(({ rootDir, filePaths }) => ({
+      rootDir,
+      filePaths: filePaths.slice(0, Math.ceil(filePaths.length / 2)),
+    }));
+    const secondHalfByDir = sortedFilePathsByDir.map(({ rootDir, filePaths }) => ({
+      rootDir,
+      filePaths: filePaths.slice(Math.ceil(filePaths.length / 2)),
+    }));
+
+    // Stage 1: Collect first half of files
+    const firstCollectResults = await withMemoryLogging('Collect Files (first half)', async () =>
+      Promise.all(
+        firstHalfByDir.map(({ rootDir, filePaths }) => deps.collectFiles(filePaths, rootDir, config, progressCallback)),
       ),
-      gitDiffPromise,
-      gitLogPromise,
-      prefetchPromise,
-    ]);
+    );
+    const firstRawFiles = firstCollectResults.flatMap((curr) => curr.rawFiles);
 
-    const rawFiles = collectResults.flatMap((curr) => curr.rawFiles);
-    const allSkippedFiles = collectResults.flatMap((curr) => curr.skippedFiles);
+    // Start security on first batch immediately (overlaps with second half collection).
+    // Use runSecurityCheck directly (not validateFileSafety) to send file tasks without
+    // git diff/log, which will be included in the second batch.
+    let firstSecurityPromise: Promise<SuspiciousFileResult[]> = Promise.resolve([]);
+    if (config.security.enableSecurityCheck && securityTaskRunner) {
+      progressCallback('Running security check...');
+      firstSecurityPromise = deps.runSecurityCheck(firstRawFiles, progressCallback, undefined, undefined, undefined, {
+        taskRunner: securityTaskRunner,
+      });
+    }
 
-    // Run security check and file processing in parallel using speculative execution.
-    // Security check runs on worker threads (secretlint). File processing runs lightweight
-    // transforms on the main thread by default; when compress/removeComments is enabled,
-    // it uses a separate worker pool. Both paths benefit from the overlap.
-    // In the common case (no suspicious files), the speculative processing result is used directly.
-    // If suspicious files are found (rare), file processing is re-run on the filtered safe subset.
-    progressCallback('Running security check...');
-    const securityPromise = withMemoryLogging('Security Check', () =>
-      deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult, undefined, {
-        taskRunner: securityTaskRunner ?? undefined,
-      }),
+    // Stage 2: Collect second half in parallel with security processing first batch
+    const secondCollectResults = await withMemoryLogging('Collect Files (second half)', async () =>
+      Promise.all(
+        secondHalfByDir.map(({ rootDir, filePaths }) =>
+          deps.collectFiles(filePaths, rootDir, config, progressCallback),
+        ),
+      ),
+    );
+    const secondRawFiles = secondCollectResults.flatMap((curr) => curr.rawFiles);
+
+    const rawFiles = [...firstRawFiles, ...secondRawFiles];
+    const allSkippedFiles = [
+      ...firstCollectResults.flatMap((curr) => curr.skippedFiles),
+      ...secondCollectResults.flatMap((curr) => curr.skippedFiles),
+    ];
+
+    // Start security on second batch + git diff/log content.
+    // The security worker thread processes first-batch tasks while these are queued,
+    // so the second batch begins immediately after the first batch finishes.
+    let secondSecurityPromise: Promise<SuspiciousFileResult[]> = Promise.resolve([]);
+    if (config.security.enableSecurityCheck && securityTaskRunner) {
+      secondSecurityPromise = deps.runSecurityCheck(
+        secondRawFiles,
+        progressCallback,
+        gitDiffResult,
+        gitLogResult,
+        undefined,
+        { taskRunner: securityTaskRunner },
+      );
+    }
+
+    // Suppress unhandled rejection if one batch fails while the other is still running.
+    // Errors re-surface when securityPromise is awaited below.
+    firstSecurityPromise.catch(() => {});
+    secondSecurityPromise.catch(() => {});
+
+    // Combined security promise that merges both batches and separates by type
+    const securityPromise = Promise.all([firstSecurityPromise, secondSecurityPromise]).then(
+      ([firstResults, secondResults]) => {
+        const allResults = [...firstResults, ...secondResults];
+        const suspiciousGitDiffResults = allResults.filter((r) => r.type === 'gitDiff');
+        const suspiciousGitLogResults = allResults.filter((r) => r.type === 'gitLog');
+
+        // Log warnings for suspicious git content (mirrors validateFileSafety behavior)
+        if (suspiciousGitDiffResults.length > 0) {
+          logger.warn('Security issues found in Git diffs, but they will still be included in the output');
+          for (const result of suspiciousGitDiffResults) {
+            logger.warn(`  - ${result.filePath}: ${result.messages.length} ${result.messages.length === 1 ? 'issue' : 'issues'} detected`);
+          }
+        }
+        if (suspiciousGitLogResults.length > 0) {
+          logger.warn('Security issues found in Git logs, but they will still be included in the output');
+          for (const result of suspiciousGitLogResults) {
+            logger.warn(`  - ${result.filePath}: ${result.messages.length} ${result.messages.length === 1 ? 'issue' : 'issues'} detected`);
+          }
+        }
+
+        return {
+          suspiciousFilesResults: allResults.filter((r) => r.type === 'file'),
+          suspiciousGitDiffResults,
+          suspiciousGitLogResults,
+        };
+      },
     );
     const processPromise = withMemoryLogging('Process Files', () =>
       deps.processFiles(rawFiles, config, progressCallback),

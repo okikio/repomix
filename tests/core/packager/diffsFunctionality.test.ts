@@ -91,6 +91,7 @@ index 123..456 100644
       collectFiles: mockCollectFiles,
       processFiles: mockProcessFiles,
       validateFileSafety: mockValidateFileSafety,
+      runSecurityCheck: vi.fn().mockResolvedValue([]),
       produceOutput: mockProduceOutput,
       generateOutput: vi.fn().mockResolvedValue('mocked output'),
       writeOutputToDisk: vi.fn().mockResolvedValue(undefined),
@@ -116,7 +117,10 @@ index 123..456 100644
 
     // Mock dependencies
     const mockSearchFiles = vi.fn().mockResolvedValue({ filePaths: ['test.js'], emptyDirPaths: [] });
-    const mockCollectFiles = vi.fn().mockResolvedValue({ rawFiles: processedFiles, skippedFiles: [] });
+    const mockCollectFiles = vi
+      .fn()
+      .mockResolvedValueOnce({ rawFiles: processedFiles, skippedFiles: [] })
+      .mockResolvedValueOnce({ rawFiles: [], skippedFiles: [] });
     const mockProcessFiles = vi.fn().mockResolvedValue(processedFiles);
     const mockValidateFileSafety = vi.fn().mockResolvedValue({
       safeFilePaths: ['test.js'],
@@ -155,6 +159,7 @@ index 123..456 100644
       collectFiles: mockCollectFiles,
       processFiles: mockProcessFiles,
       validateFileSafety: mockValidateFileSafety,
+      runSecurityCheck: vi.fn().mockResolvedValue([]),
       produceOutput: mockProduceOutput,
       generateOutput: vi.fn().mockResolvedValue('Generated output with diffs included'),
       writeOutputToDisk: vi.fn().mockResolvedValue(undefined),

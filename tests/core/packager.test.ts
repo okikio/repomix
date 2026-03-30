@@ -43,7 +43,11 @@ describe('packager', () => {
         emptyDirPaths: [],
       }),
       sortPaths: vi.fn().mockImplementation((paths) => paths),
-      collectFiles: vi.fn().mockResolvedValue({ rawFiles: mockRawFiles, skippedFiles: [] }),
+      // collectFiles is called twice (pipelined collection: first half, second half)
+      collectFiles: vi
+        .fn()
+        .mockResolvedValueOnce({ rawFiles: [mockRawFiles[0]], skippedFiles: [] })
+        .mockResolvedValueOnce({ rawFiles: [mockRawFiles[1]], skippedFiles: [] }),
       processFiles: vi.fn().mockReturnValue(mockProcessedFiles),
       validateFileSafety: vi.fn().mockResolvedValue({
         safeFilePaths: mockFilePaths,
@@ -52,6 +56,7 @@ describe('packager', () => {
         suspiciousGitDiffResults: [],
         suspiciousGitLogResults: [],
       }),
+      runSecurityCheck: vi.fn().mockResolvedValue([]),
       produceOutput: vi.fn().mockResolvedValue({
         outputForMetrics: mockOutput,
       }),
@@ -90,20 +95,15 @@ describe('packager', () => {
     const result = await pack(['root'], mockConfig, progressCallback, mockDeps);
 
     expect(mockDeps.searchFiles).toHaveBeenCalledWith('root', mockConfig, undefined);
-    expect(mockDeps.collectFiles).toHaveBeenCalledWith(mockFilePaths, 'root', mockConfig, progressCallback);
-    expect(mockDeps.validateFileSafety).toHaveBeenCalled();
+    // collectFiles is called twice (pipelined: first half then second half)
+    expect(mockDeps.collectFiles).toHaveBeenCalledTimes(2);
+    expect(mockDeps.collectFiles).toHaveBeenCalledWith(['file1.txt'], 'root', mockConfig, progressCallback);
+    expect(mockDeps.collectFiles).toHaveBeenCalledWith([file2Path], 'root', mockConfig, progressCallback);
+    // Security runs via runSecurityCheck directly (pipelined with collection)
+    expect(mockDeps.runSecurityCheck).toHaveBeenCalledTimes(2);
     expect(mockDeps.processFiles).toHaveBeenCalled();
     expect(mockDeps.calculateMetrics).toHaveBeenCalled();
 
-    expect(mockDeps.validateFileSafety).toHaveBeenCalledWith(
-      mockRawFiles,
-      progressCallback,
-      mockConfig,
-      undefined,
-      undefined,
-      undefined,
-      { taskRunner: expect.anything() },
-    );
     // File processing runs speculatively on all raw files (in parallel with security check).
     // When no suspicious files are found, the speculative result is used directly.
     expect(mockDeps.processFiles).toHaveBeenCalledWith(mockRawFiles, mockConfig, progressCallback);
