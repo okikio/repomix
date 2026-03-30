@@ -20,24 +20,26 @@ export interface FileReadResult {
  */
 export const readRawFile = async (filePath: string, maxFileSize: number): Promise<FileReadResult> => {
   try {
-    // Check binary extension first (no I/O needed) to skip stat + read for binary files
+    // Check binary extension first (no I/O needed) to skip read for binary files
     if (isBinaryPath(filePath)) {
       logger.debug(`Skipping binary file: ${filePath}`);
       return { content: null, skippedReason: 'binary-extension' };
     }
 
-    const stats = await fs.stat(filePath);
+    logger.trace(`Reading file: ${filePath}`);
 
-    if (stats.size > maxFileSize) {
-      const sizeKB = (stats.size / 1024).toFixed(1);
+    // Read file directly and check buffer length instead of calling fs.stat() first.
+    // This eliminates one libuv threadpool operation per file. Node's readFile internally
+    // does open+fstat+read+close; the separate stat() added a redundant open+stat+close
+    // that doubled the libuv queue depth during file collection.
+    const buffer = await fs.readFile(filePath);
+
+    if (buffer.length > maxFileSize) {
+      const sizeKB = (buffer.length / 1024).toFixed(1);
       const maxSizeKB = (maxFileSize / 1024).toFixed(1);
       logger.trace(`File exceeds size limit: ${sizeKB}KB > ${maxSizeKB}KB (${filePath})`);
       return { content: null, skippedReason: 'size-limit' };
     }
-
-    logger.trace(`Reading file: ${filePath}`);
-
-    const buffer = await fs.readFile(filePath);
 
     if (await isBinaryFile(buffer)) {
       logger.debug(`Skipping binary file (content check): ${filePath}`);
