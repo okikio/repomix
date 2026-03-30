@@ -207,6 +207,8 @@ export const pack = async (
     // common path, or are harmlessly discarded in the rare path (suspicious files found).
     let speculativeOutputPromise: Promise<string> | undefined;
     let speculativeMetricsOnlyPromise: Promise<Awaited<ReturnType<typeof deps.calculateMetrics>>> | undefined;
+    let speculativeWritePromise: Promise<void> | undefined;
+    let speculativeClipboardPromise: Promise<void> | undefined;
 
     if (!isSplitOutput) {
       // Chain from processPromise: generate output, then start metrics with output as a promise
@@ -244,10 +246,38 @@ export const pack = async (
         );
       });
 
+      // Start writing output to disk and copying to clipboard as soon as output generation
+      // completes, overlapping disk I/O with the remaining security check.
+      //
+      // Previously, writeOutputToDisk and copyToClipboardIfEnabled waited until after the
+      // security check resolved, adding their latency sequentially to the critical path.
+      // The security check (secretlint on worker threads) is the pipeline bottleneck after
+      // file collection, typically taking 200-400ms. By chaining write/clipboard from the
+      // output promise, they execute during the security check window and are already
+      // complete (or nearly so) when the security check finishes.
+      //
+      // In the common case (no suspicious files), the speculative write is the final result.
+      // In the rare case (suspicious files found), the output file is overwritten with
+      // the corrected output in the fallback path, so the speculative write is harmless.
+      //
+      // Skip speculative write for stdout mode since stdout output cannot be retracted
+      // if the security check later finds suspicious files.
+      if (config.output.stdout !== true) {
+        speculativeWritePromise = speculativeOutputPromise.then(async (output) => {
+          progressCallback('Writing output file...');
+          await deps.writeOutputToDisk(output, config);
+        });
+        speculativeClipboardPromise = speculativeOutputPromise.then(async (output) => {
+          await deps.copyToClipboardIfEnabled(output, progressCallback, config);
+        });
+      }
+
       // Suppress unhandled rejection for paths that don't await these promises
       // (skill generation, split output, or rare suspicious-files case)
       speculativeOutputPromise.catch(() => {});
       speculativeMetricsOnlyPromise.catch(() => {});
+      speculativeWritePromise?.catch(() => {});
+      speculativeClipboardPromise?.catch(() => {});
     }
 
     const [{ suspiciousFilesResults, suspiciousGitDiffResults, suspiciousGitLogResults }, processedFilesSpeculative] =
@@ -348,19 +378,27 @@ export const pack = async (
 
     if (suspiciousFilesResults.length === 0 && speculativeOutputPromise && speculativeMetricsOnlyPromise) {
       // Common case: speculative results are valid (may already be resolved).
-      // Start writing output to disk as soon as it's generated, overlapping the disk I/O
-      // with the remaining metrics worker computation. This hides ~42ms of write time
-      // and ~10ms of clipboard copy that were previously sequential after metrics.
-      // Write and clipboard are also parallelized since they're independent operations.
-      const output = await speculativeOutputPromise;
-      progressCallback('Writing output file...');
-      const [, , speculativeMetrics] = await Promise.all([
-        deps.writeOutputToDisk(output, config),
-        deps.copyToClipboardIfEnabled(output, progressCallback, config),
-        speculativeMetricsOnlyPromise,
-      ]);
-
-      metrics = speculativeMetrics;
+      // Write/clipboard were started speculatively during the security check phase,
+      // so they are already complete or nearly complete by now.
+      if (speculativeWritePromise) {
+        // Non-stdout: speculative write/clipboard already in progress
+        const [, , speculativeMetrics] = await Promise.all([
+          speculativeWritePromise,
+          speculativeClipboardPromise,
+          speculativeMetricsOnlyPromise,
+        ]);
+        metrics = speculativeMetrics;
+      } else {
+        // stdout mode: write was deferred to avoid irreversible output before security check
+        const output = await speculativeOutputPromise;
+        progressCallback('Writing output file...');
+        const [, , speculativeMetrics] = await Promise.all([
+          deps.writeOutputToDisk(output, config),
+          deps.copyToClipboardIfEnabled(output, progressCallback, config),
+          speculativeMetricsOnlyPromise,
+        ]);
+        metrics = speculativeMetrics;
+      }
     } else {
       // Rare case: suspicious files found, regenerate with safe files
       await warmupPromise;
