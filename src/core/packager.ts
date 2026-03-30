@@ -13,6 +13,7 @@ import { getGitDiffs } from './git/gitDiffHandle.js';
 import { getGitLogs } from './git/gitLogHandle.js';
 import { calculateMetrics, createMetricsTaskRunner } from './metrics/calculateMetrics.js';
 import { generateOutput } from './output/outputGenerate.js';
+import { prefetchFileChangeCounts } from './output/outputSort.js';
 import { copyToClipboardIfEnabled } from './packager/copyToClipboardIfEnabled.js';
 import { produceOutput } from './packager/produceOutput.js';
 import { writeOutputToDisk } from './packager/writeOutputToDisk.js';
@@ -54,6 +55,7 @@ const defaultDeps = {
   getGitDiffs,
   getGitLogs,
   packSkill,
+  prefetchFileChangeCounts,
 };
 
 export interface PackOptions {
@@ -111,10 +113,10 @@ export const pack = async (
   const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
 
   try {
-    // Run file collection and git operations in parallel since they are independent:
-    // - collectFiles reads file contents from disk
-    // - getGitDiffs/getGitLogs spawn git subprocesses
-    // Neither depends on the other's results.
+    // Run file collection, git operations, and sort data prefetch in parallel since
+    // they are independent. Pre-fetching git file change counts here populates the
+    // module-level cache in outputSort.ts, so sortOutputFiles (called later during
+    // output generation) returns instantly from cache instead of spawning a git subprocess.
     progressCallback('Collecting files...');
     const [collectResults, gitDiffResult, gitLogResult] = await Promise.all([
       withMemoryLogging(
@@ -128,6 +130,7 @@ export const pack = async (
       ),
       deps.getGitDiffs(rootDirs, config),
       deps.getGitLogs(rootDirs, config),
+      deps.prefetchFileChangeCounts(config).catch(() => {}),
     ]);
 
     const rawFiles = collectResults.flatMap((curr) => curr.rawFiles);
@@ -163,13 +166,20 @@ export const pack = async (
     // For split output mode, fall back to the existing produceOutput flow after security.
     const isSplitOutput = config.output.splitOutput !== undefined;
 
-    // For non-split output, chain: process → output → metrics (all speculative).
+    // For non-split output, chain: process → [output || metrics] (all speculative).
+    // Output generation runs on the main thread while file token counting runs on
+    // worker threads. By passing the output as a promise to calculateMetrics, file
+    // and git token counting start immediately without waiting for output generation.
+    // calculateMetrics only awaits the output promise when it needs the character count
+    // for the final token estimation or full output tokenization.
     // Errors are suppressed here; they re-surface when the promise is awaited in the
     // common path, or are harmlessly discarded in the rare path (suspicious files found).
     const speculativeMetricsPromise = !isSplitOutput
       ? processPromise.then(async (processed) => {
+          // Ensure tiktoken is initialized before submitting metrics tasks
+          await warmupPromise;
           progressCallback('Generating output...');
-          const output = await deps.generateOutput(
+          const outputPromise = deps.generateOutput(
             rootDirs,
             config,
             processed,
@@ -179,13 +189,14 @@ export const pack = async (
             filePathsByRoot,
             emptyDirPaths,
           );
-          // Ensure tiktoken is initialized before submitting metrics tasks
-          await warmupPromise;
-          const metricsResult = await withMemoryLogging('Calculate Metrics', () =>
-            deps.calculateMetrics(processed, output, progressCallback, config, gitDiffResult, gitLogResult, {
+          // Start metrics immediately — file token counting on worker threads overlaps
+          // with output generation on the main thread.
+          const metricsPromise = withMemoryLogging('Calculate Metrics', () =>
+            deps.calculateMetrics(processed, outputPromise, progressCallback, config, gitDiffResult, gitLogResult, {
               taskRunner: metricsTaskRunner,
             }),
           );
+          const [output, metricsResult] = await Promise.all([outputPromise, metricsPromise]);
           return { output, metrics: metricsResult };
         })
       : undefined;

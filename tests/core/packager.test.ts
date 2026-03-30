@@ -62,6 +62,7 @@ describe('packager', () => {
         run: vi.fn().mockResolvedValue(0),
         cleanup: vi.fn().mockResolvedValue(undefined),
       }),
+      prefetchFileChangeCounts: vi.fn().mockResolvedValue(undefined),
       calculateMetrics: vi.fn().mockResolvedValue({
         totalFiles: 2,
         totalCharacters: 11,
@@ -117,11 +118,12 @@ describe('packager', () => {
     expect(mockDeps.copyToClipboardIfEnabled).toHaveBeenCalledWith(mockOutput, progressCallback, mockConfig);
     expect(mockDeps.produceOutput).not.toHaveBeenCalled();
 
-    // Metrics receives the already-generated output directly (not as a promise)
-    // because output generation completes before metrics starts in the speculative chain
+    // Metrics receives the output as a promise since output generation runs
+    // in parallel with metrics file token counting on the speculative chain
     const calculateMetricsCall = mockDeps.calculateMetrics.mock.calls[0];
     expect(calculateMetricsCall[0]).toBe(mockProcessedFiles);
-    expect(calculateMetricsCall[1]).toBe(mockOutput);
+    expect(calculateMetricsCall[1]).toBeInstanceOf(Promise);
+    await expect(calculateMetricsCall[1]).resolves.toBe(mockOutput);
     expect(calculateMetricsCall[2]).toBe(progressCallback);
     expect(calculateMetricsCall[3]).toBe(mockConfig);
 
