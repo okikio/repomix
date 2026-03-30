@@ -97,13 +97,19 @@ export const calculateMetrics = async (
         }
       }
 
-      // Add files by size until we cover 50% of total content characters.
-      // This ensures the chars-per-token ratio is representative enough for estimation
-      // while minimizing worker thread load and CPU contention with security.
+      // Add files by size for ratio estimation, capped by both coverage and count.
+      // The largest files provide the most representative chars-per-token ratio per
+      // tokenization cost. A fixed file count cap prevents over-tokenizing repos where
+      // many small files would be needed to reach the percentage-based coverage target
+      // (e.g., 171 files for 50% coverage in a 1000-file repo with uniformly small files).
+      // The cap matches the sample size used in the non-threshold estimation path.
+      const ratioSampleCap = Math.max(topFilesLength * 10, 50);
+      const aboveThresholdCount = targetSet.size;
+      const maxTargetFiles = aboveThresholdCount + ratioSampleCap;
       const coverageTarget = totalChars * 0.5;
       let coveredChars = 0;
       for (const f of sortedBySize) {
-        if (coveredChars >= coverageTarget) {
+        if (coveredChars >= coverageTarget || targetSet.size >= maxTargetFiles) {
           break;
         }
         targetSet.add(f.path);
