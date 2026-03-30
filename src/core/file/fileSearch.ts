@@ -30,6 +30,8 @@ export interface FileSearchResult {
   emptyDirPaths: string[];
 }
 
+const READDIR_CONCURRENCY = 32;
+
 const findEmptyDirectories = async (
   rootDir: string,
   directories: string[],
@@ -37,22 +39,36 @@ const findEmptyDirectories = async (
 ): Promise<string[]> => {
   const emptyDirs: string[] = [];
 
-  for (const dir of directories) {
-    const fullPath = path.join(rootDir, dir);
-    try {
-      const entries = await fs.readdir(fullPath);
-      const hasVisibleContents = entries.some((entry) => !entry.startsWith('.'));
+  // Process directory readdir calls in parallel batches to reduce I/O latency.
+  // Each readdir is an independent I/O operation; batching them overlaps kernel
+  // round-trips instead of waiting for each one sequentially.
+  for (let i = 0; i < directories.length; i += READDIR_CONCURRENCY) {
+    const batch = directories.slice(i, i + READDIR_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async (dir) => {
+        const fullPath = path.join(rootDir, dir);
+        try {
+          const entries = await fs.readdir(fullPath);
+          const hasVisibleContents = entries.some((entry) => !entry.startsWith('.'));
 
-      if (!hasVisibleContents) {
-        // This checks if the directory itself matches any ignore patterns
-        const shouldIgnore = ignorePatterns.some((pattern) => minimatch(dir, pattern) || minimatch(`${dir}/`, pattern));
-
-        if (!shouldIgnore) {
-          emptyDirs.push(dir);
+          if (!hasVisibleContents) {
+            const shouldIgnore = ignorePatterns.some(
+              (pattern) => minimatch(dir, pattern) || minimatch(`${dir}/`, pattern),
+            );
+            if (!shouldIgnore) {
+              return dir;
+            }
+          }
+        } catch (error) {
+          logger.debug(`Error checking directory ${dir}:`, error);
         }
+        return null;
+      }),
+    );
+    for (const dir of results) {
+      if (dir !== null) {
+        emptyDirs.push(dir);
       }
-    } catch (error) {
-      logger.debug(`Error checking directory ${dir}:`, error);
     }
   }
 

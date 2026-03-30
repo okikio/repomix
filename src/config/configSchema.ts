@@ -1,5 +1,11 @@
 import { z } from 'zod';
-import { TOKEN_ENCODINGS } from '../core/metrics/TokenCounter.js';
+
+// Inline the encoding names to avoid importing TokenCounter.js (~12ms) at module
+// load time. TokenCounter.js imports the logger module chain, and the config schema
+// is on the defaultAction preload critical path. By inlining this constant, the
+// configSchema module only depends on zod, shaving ~12ms off the preload.
+// Keep this list in sync with TOKEN_ENCODINGS in src/core/metrics/TokenCounter.ts.
+const TOKEN_ENCODINGS = ['o200k_base', 'cl100k_base', 'p50k_base', 'p50k_edit', 'r50k_base'] as const;
 
 // Output style enum
 export const repomixOutputStyleSchema = z.enum(['xml', 'markdown', 'json', 'plain']);

@@ -8,6 +8,7 @@ import type { RepomixProgressCallback } from '../shared/types.js';
 import { collectFiles, type SkippedFileInfo } from './file/fileCollect.js';
 import { sortPaths } from './file/filePathSort.js';
 import { processFiles } from './file/fileProcess.js';
+import { prewarmBinaryDeps } from './file/fileRead.js';
 import { searchFiles } from './file/fileSearch.js';
 import type { FilesByRoot } from './file/fileTreeGenerate.js';
 import type { ProcessedFile } from './file/fileTypes.js';
@@ -97,6 +98,14 @@ export const pack = async (
   };
 
   logMemoryUsage('Pack - Start');
+
+  // Pre-load binary detection modules (is-binary-path, isbinaryfile) for file collection.
+  // These are lazy-loaded in fileRead.ts to reduce the defaultAction preload time by ~13ms.
+  // Starting the import here overlaps the loading with worker warmup and searchFiles I/O,
+  // so the modules are ready before collectFiles starts reading files.
+  prewarmBinaryDeps().catch((error) => {
+    logger.debug('Binary detection module prewarm failed (non-fatal):', error);
+  });
 
   // Lazy-load output generation modules (Handlebars, templates, etc.) during I/O-bound phases.
   // These modules add ~40ms to the static import graph that would otherwise block the

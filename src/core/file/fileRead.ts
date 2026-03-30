@@ -1,7 +1,28 @@
 import * as fs from 'node:fs/promises';
-import isBinaryPath from 'is-binary-path';
-import { isBinaryFile } from 'isbinaryfile';
 import { logger } from '../../shared/logger.js';
+
+// Lazy-load binary detection modules to avoid their combined ~13ms import cost.
+// is-binary-path (~8ms) and isbinaryfile (~5ms) are only needed during file
+// collection, but their static imports add to the defaultAction preload chain.
+// By deferring them, the preload completes ~13ms faster, which eliminates the
+// gap where the main thread waits for the preload after cliRun finishes.
+let _isBinaryPath: ((filePath: string) => boolean) | undefined;
+let _isBinaryFile: ((bytes: Buffer, size?: number) => Promise<boolean>) | undefined;
+const loadBinaryDeps = async () => {
+  if (!_isBinaryPath || !_isBinaryFile) {
+    const [bpMod, bfMod] = await Promise.all([import('is-binary-path'), import('isbinaryfile')]);
+    _isBinaryPath = bpMod.default;
+    _isBinaryFile = bfMod.isBinaryFile;
+  }
+  // biome-ignore lint/style/noNonNullAssertion: guaranteed assigned in the if-block above
+  return { isBinaryPath: _isBinaryPath!, isBinaryFile: _isBinaryFile! };
+};
+
+/**
+ * Pre-warm binary detection modules so they're ready when file collection starts.
+ * Called from pack() at the start, overlapping the ~13ms import with searchFiles I/O.
+ */
+export const prewarmBinaryDeps = (): Promise<unknown> => loadBinaryDeps();
 
 // Lazy-load jschardet and iconv-lite to avoid their combined ~19ms import cost.
 // They're only needed for non-UTF-8 files (~1% of source code), so the common
@@ -38,6 +59,8 @@ export interface FileReadResult {
  */
 export const readRawFile = async (filePath: string, maxFileSize: number): Promise<FileReadResult> => {
   try {
+    const { isBinaryPath, isBinaryFile } = await loadBinaryDeps();
+
     // Check binary extension first (no I/O needed) to skip read for binary files
     if (isBinaryPath(filePath)) {
       logger.debug(`Skipping binary file: ${filePath}`);
