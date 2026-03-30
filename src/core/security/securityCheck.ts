@@ -18,6 +18,16 @@ export interface SuspiciousFileResult {
 // while still distributing work evenly across the pool.
 const FILES_PER_BATCH = 50;
 
+// Cap the worker thread count for security checks to minimize CPU contention with the
+// metrics worker pool (which runs the CPU-intensive token counting on all cores).
+// Security runs off the critical path in the pipeline: security (~200ms with 1 thread)
+// overlaps with process (~80ms) → output (~50ms) → metrics (~340ms), so security
+// always finishes before metrics. Using fewer threads avoids starving the metrics pool
+// of CPU time, which otherwise adds ~140ms of contention on a 4-core machine.
+// With batching (50 files/batch), 1 thread processes ~1000 files in ~200ms, well within
+// the pipeline's tolerance.
+const SECURITY_MAX_TASKS_FOR_THREAD_CALC = 100;
+
 export const runSecurityCheck = async (
   rawFiles: RawFile[],
   progressCallback: RepomixProgressCallback = () => {},
@@ -64,11 +74,14 @@ export const runSecurityCheck = async (
   }
 
   // Use pre-created task runner if provided (pool lifecycle managed by caller),
-  // otherwise create a new one.
+  // otherwise create a new one with a capped thread count to reduce CPU contention.
   const taskRunner =
     options.taskRunner ??
     deps.initTaskRunner<SecurityCheckTask, SuspiciousFileResult | null>({
-      numOfTasks: rawFiles.length + gitDiffTasks.length + gitLogTasks.length,
+      numOfTasks: Math.min(
+        rawFiles.length + gitDiffTasks.length + gitLogTasks.length,
+        SECURITY_MAX_TASKS_FOR_THREAD_CALC,
+      ),
       workerType: 'securityCheck',
       runtime: 'worker_threads',
     });
