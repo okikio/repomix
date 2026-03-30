@@ -85,13 +85,16 @@ export const pack = async (
   // By starting warmup before search, the CPU-intensive tokenizer initialization overlaps
   // with the I/O-bound file search (git ls-files, ~75ms) and the beginning of file collection,
   // reducing the total warmup contention window during file I/O.
-  // Uses getProcessConcurrency() as an upper-bound estimate for thread count since the
-  // actual file count is not yet known. For typical repos (100+ files), this matches the
-  // count that would be computed from allFilePaths.length.
-  // Use processConcurrency * 100 as an upper-bound task estimate to ensure
-  // maxThreads equals processConcurrency (the maximum the pool would ever create).
+  //
+  // Cap metrics threads to processConcurrency - 1 to reserve one core for the security
+  // worker thread and main thread (output generation) that run concurrently during the
+  // speculative execution phase. On a 4-core machine, this reduces metrics threads from 4
+  // to 3, eliminating CPU contention that otherwise inflates the metrics phase by ~14%.
+  // On high-core machines (8+), the -1 has negligible impact since one fewer thread
+  // among many barely affects throughput.
   // The TASKS_PER_THREAD threshold in getWorkerThreadCount is 100.
-  const estimatedTasks = getProcessConcurrency() * 100;
+  const metricsMaxThreads = Math.max(1, getProcessConcurrency() - 1);
+  const estimatedTasks = metricsMaxThreads * 100;
   const metricsTaskRunner = deps.createMetricsTaskRunner(estimatedTasks);
   const warmupTask = { content: '', encoding: config.tokenCount.encoding };
   const warmupThreadCount = getWorkerThreadCount(estimatedTasks).maxThreads;
