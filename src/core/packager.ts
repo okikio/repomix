@@ -288,13 +288,17 @@ export const pack = async (
         if (suspiciousGitDiffResults.length > 0) {
           logger.warn('Security issues found in Git diffs, but they will still be included in the output');
           for (const result of suspiciousGitDiffResults) {
-            logger.warn(`  - ${result.filePath}: ${result.messages.length} ${result.messages.length === 1 ? 'issue' : 'issues'} detected`);
+            logger.warn(
+              `  - ${result.filePath}: ${result.messages.length} ${result.messages.length === 1 ? 'issue' : 'issues'} detected`,
+            );
           }
         }
         if (suspiciousGitLogResults.length > 0) {
           logger.warn('Security issues found in Git logs, but they will still be included in the output');
           for (const result of suspiciousGitLogResults) {
-            logger.warn(`  - ${result.filePath}: ${result.messages.length} ${result.messages.length === 1 ? 'issue' : 'issues'} detected`);
+            logger.warn(
+              `  - ${result.filePath}: ${result.messages.length} ${result.messages.length === 1 ? 'issue' : 'issues'} detected`,
+            );
           }
         }
 
