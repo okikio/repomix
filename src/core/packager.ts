@@ -148,7 +148,12 @@ export const pack = async (
   // Without this, the cold start happens sequentially on the critical path after collectFiles.
   const securityTaskRunner = config.security.enableSecurityCheck ? deps.createSecurityTaskRunner() : null;
   if (securityTaskRunner) {
-    securityTaskRunner.run({ filePath: '', content: '', type: 'file' as const }).catch((error) => {
+    // Use a valid filePath so the warmup task exercises the full secretlint scanning code
+    // path (not just module loading). This JIT-compiles the secretlint rule regex matching
+    // and lintSource function before real tasks arrive, reducing first-batch latency.
+    // An empty filePath causes secretlint to throw before scanning, leaving the scanning
+    // code path un-optimized.
+    securityTaskRunner.run({ filePath: 'warmup.js', content: '', type: 'file' as const }).catch((error) => {
       logger.debug('Security worker warmup failed (non-fatal):', error);
     });
   }
