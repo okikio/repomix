@@ -113,14 +113,22 @@ export const pack = async (
   // with the I/O-bound file search (git ls-files, ~75ms) and the beginning of file collection,
   // reducing the total warmup contention window during file I/O.
   //
-  // Cap metrics threads to processConcurrency - 1 to reserve one core for the security
-  // worker thread and main thread (output generation) that run concurrently during the
-  // speculative execution phase. On a 4-core machine, this reduces metrics threads from 4
-  // to 3, eliminating CPU contention that otherwise inflates the metrics phase by ~14%.
-  // On high-core machines (8+), the -1 has negligible impact since one fewer thread
-  // among many barely affects throughput.
+  // Adapt metrics thread count based on the expected tokenization workload:
+  // - tokenCountTree: true → all files tokenized (~1000 files, ~20 batches) → need full threads
+  // - tokenCountTree: number > 0 or false → ~50 files sampled (1 batch) → 1 thread suffices
+  //
+  // After the sample size cap (commit a6f43cc), the threshold/default paths only send ~50
+  // files in 1 batch, so extra metrics threads sit idle. Reducing to 1 thread for these
+  // paths frees CPU cores for the security worker (which runs ~300ms cold on 1 thread).
+  // This eliminates the CPU contention that previously existed between 3 idle metrics
+  // threads and the security scanner during the speculative execution phase.
+  //
+  // For the "all files" path (tokenCountTree: true), use processConcurrency - 2 threads
+  // to reserve cores for 1 security thread and the main thread (output generation).
   // The TASKS_PER_THREAD threshold in getWorkerThreadCount is 100.
-  const metricsMaxThreads = Math.max(1, getProcessConcurrency() - 1);
+  const tokenCountTreeValue = config.output.tokenCountTree;
+  const allFilesMode = tokenCountTreeValue === true || tokenCountTreeValue === 'true';
+  const metricsMaxThreads = allFilesMode ? Math.max(1, getProcessConcurrency() - 2) : 1;
   const estimatedTasks = metricsMaxThreads * 100;
   const metricsTaskRunner = deps.createMetricsTaskRunner(estimatedTasks);
   const warmupTask = { content: '', encoding: config.tokenCount.encoding };
