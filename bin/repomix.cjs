@@ -59,6 +59,21 @@ function setupErrorHandlers() {
 // import latency.
 globalThis.__repomixDefaultAction = import('../lib/cli/actions/defaultAction.js');
 
+// Pre-create the metrics worker pool and start gpt-tokenizer warmup at the earliest
+// possible point. The gpt-tokenizer encoding module takes ~300ms to initialize on a
+// worker thread. By starting this import chain here (only needs processConcurrency.js
+// + tinypool, ~20ms), the worker begins loading gpt-tokenizer ~150ms before pack()
+// would normally create it. This hides the warmup entirely behind CLI framework setup,
+// config loading, and file search/collection — eliminating the ~100ms gap where the
+// main thread previously waited for warmup to complete before starting output generation.
+globalThis.__repomixMetricsWarmup = import('../lib/shared/processConcurrency.js')
+  .then(({ initTaskRunner }) => {
+    const runner = initTaskRunner({ numOfTasks: 100, workerType: 'calculateMetrics', runtime: 'worker_threads' });
+    const warmup = runner.run({ content: '', encoding: 'o200k_base' }).catch(() => 0);
+    return { runner, warmup };
+  })
+  .catch(() => null);
+
 (async () => {
   try {
     setupErrorHandlers();

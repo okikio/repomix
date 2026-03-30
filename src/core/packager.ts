@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { RepomixConfigMerged } from '../config/configSchema.js';
 import { logger } from '../shared/logger.js';
 import { logMemoryUsage, withMemoryLogging } from '../shared/memoryUtils.js';
+import type { TaskRunner } from '../shared/processConcurrency.js';
 import { getProcessConcurrency, getWorkerThreadCount } from '../shared/processConcurrency.js';
 import type { RepomixProgressCallback } from '../shared/types.js';
 import { collectFiles, type SkippedFileInfo } from './file/fileCollect.js';
@@ -69,11 +70,17 @@ const defaultDeps = {
   prefetchFileChangeCounts,
 };
 
+export interface EarlyMetricsResult {
+  runner: TaskRunner<import('./metrics/workers/calculateMetricsWorker.js').TokenCountTask, number>;
+  warmup: Promise<number>;
+}
+
 export interface PackOptions {
   skillName?: string;
   skillDir?: string;
   skillProjectName?: string;
   skillSourceUrl?: string;
+  earlyMetricsPromise?: Promise<EarlyMetricsResult | null>;
 }
 
 export const pack = async (
@@ -133,13 +140,34 @@ export const pack = async (
   const allFilesMode = tokenCountTreeValue === true || tokenCountTreeValue === 'true';
   const metricsMaxThreads = allFilesMode ? Math.max(1, getProcessConcurrency() - 2) : 1;
   const estimatedTasks = metricsMaxThreads * 100;
-  const metricsTaskRunner = deps.createMetricsTaskRunner(estimatedTasks);
-  const warmupTask = { content: '', encoding: config.tokenCount.encoding };
-  const warmupThreadCount = getWorkerThreadCount(estimatedTasks).maxThreads;
-  const warmupPromises = Array.from({ length: warmupThreadCount }, () =>
-    metricsTaskRunner.run(warmupTask).catch(() => 0),
-  );
-  const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
+
+  // Use the pre-created metrics worker pool from the CJS entry point when available.
+  // The entry point starts gpt-tokenizer warmup ~150ms before pack() runs, overlapping
+  // the ~300ms tokenizer init with CLI framework setup and config loading. This eliminates
+  // the gap where the main thread previously waited for warmup before starting output
+  // generation. Only reuse the early runner for the 1-thread path (default/threshold);
+  // the all-files path needs multiple threads and must create its own pool.
+  const earlyMetrics =
+    !allFilesMode && options.earlyMetricsPromise ? await options.earlyMetricsPromise.catch(() => null) : null;
+
+  let metricsTaskRunner: TaskRunner<import('./metrics/workers/calculateMetricsWorker.js').TokenCountTask, number>;
+  let warmupPromise: Promise<number>;
+  if (earlyMetrics) {
+    metricsTaskRunner = earlyMetrics.runner;
+    warmupPromise = earlyMetrics.warmup;
+  } else {
+    // Clean up early runner we're not using (e.g., all-files mode needs more threads)
+    if (options.earlyMetricsPromise) {
+      options.earlyMetricsPromise.then((r) => r?.runner.cleanup().catch(() => {})).catch(() => {});
+    }
+    metricsTaskRunner = deps.createMetricsTaskRunner(estimatedTasks);
+    const warmupTask = { content: '', encoding: config.tokenCount.encoding };
+    const warmupThreadCount = getWorkerThreadCount(estimatedTasks).maxThreads;
+    const warmupPromises = Array.from({ length: warmupThreadCount }, () =>
+      metricsTaskRunner.run(warmupTask).catch(() => 0),
+    );
+    warmupPromise = Promise.all(warmupPromises).then(() => 0);
+  }
 
   // Pre-initialize security worker pool and warm up secretlint BEFORE searchFiles.
   // The secretlint module + rule preset loading on the worker thread takes ~150-200ms.
@@ -348,9 +376,12 @@ export const pack = async (
     let speculativeClipboardPromise: Promise<void> | undefined;
 
     if (!isSplitOutput) {
-      // Chain from processPromise: generate output, then start metrics with output as a promise
+      // Chain from processPromise: generate output, then start metrics with output as a promise.
+      // Output generation uses Handlebars templates (main thread, no worker pool needed),
+      // so it does NOT await warmupPromise — only the metrics chain needs the warm worker.
+      // This lets output generation start as soon as processFiles completes and output
+      // modules are loaded, without waiting for gpt-tokenizer to finish initializing.
       speculativeOutputPromise = processPromise.then(async (processed) => {
-        await warmupPromise;
         if (outputModulePromise) await outputModulePromise;
         progressCallback('Generating output...');
         // deps.generateOutput is guaranteed set after outputModulePromise resolves

@@ -8,7 +8,7 @@ import {
   repomixConfigCliSchema,
 } from '../../config/configSchema.js';
 import { readFilePathsFromStdin } from '../../core/file/fileStdin.js';
-import { type PackResult, pack } from '../../core/packager.js';
+import { type EarlyMetricsResult, type PackResult, pack } from '../../core/packager.js';
 import { RepomixError, rethrowValidationErrorIfZodError } from '../../shared/errorHandle.js';
 import { logger } from '../../shared/logger.js';
 import { splitPatterns } from '../../shared/patternUtils.js';
@@ -109,7 +109,14 @@ export const runDefaultAction = async (
   // This eliminates ~200ms of overhead from process spawn, module re-loading,
   // IPC serialization, and process teardown.
   const { skillName, skillDir, skillProjectName, skillSourceUrl } = cliOptions;
-  const packOptions = { skillName, skillDir, skillProjectName, skillSourceUrl };
+
+  // Retrieve the pre-created metrics worker pool promise from the CJS entry point.
+  // The entry point starts gpt-tokenizer warmup ~150ms before pack() runs,
+  // overlapping the ~300ms init with CLI framework setup and config loading.
+  // Pass the promise (not awaited) to pack() — it resolves it only when needed.
+  const earlyMetricsPromise = (globalThis as Record<string, unknown>).__repomixMetricsWarmup as
+    | Promise<EarlyMetricsResult | null>
+    | undefined;
 
   const spinner = new Spinner('Initializing...', cliOptions);
   spinner.start();
@@ -126,7 +133,13 @@ export const runDefaultAction = async (
       },
       {},
       stdinFilePaths,
-      packOptions,
+      {
+        skillName,
+        skillDir,
+        skillProjectName,
+        skillSourceUrl,
+        earlyMetricsPromise: earlyMetricsPromise ?? undefined,
+      },
     );
 
     spinner.succeed('Packing completed successfully!');
