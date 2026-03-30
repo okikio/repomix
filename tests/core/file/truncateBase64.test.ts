@@ -103,4 +103,24 @@ describe('truncateBase64Content', () => {
     const result = truncateBase64Content(input);
     expect(result).toBe(input);
   });
+
+  it('should return short content unchanged (fast-path for < 40 chars)', () => {
+    const input = 'const x = "hello";';
+    expect(input.length).toBeLessThan(40);
+    const result = truncateBase64Content(input);
+    expect(result).toBe(input);
+  });
+
+  it('should return empty string unchanged', () => {
+    expect(truncateBase64Content('')).toBe('');
+  });
+
+  it('should skip standalone regex for files with lines under 256 chars', () => {
+    // 255-char base64 run split across two short lines — should NOT trigger standalone truncation
+    // because no single line reaches 256 chars and the run is broken by a newline
+    const almostLong = 'A'.repeat(128) + '1'.repeat(60) + '+' + '/'.repeat(10);
+    const input = `${almostLong}\n${almostLong}`;
+    const result = truncateBase64Content(input);
+    expect(result).toBe(input);
+  });
 });
