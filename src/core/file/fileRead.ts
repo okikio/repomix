@@ -1,9 +1,27 @@
 import * as fs from 'node:fs/promises';
-import iconv from 'iconv-lite';
 import isBinaryPath from 'is-binary-path';
 import { isBinaryFile } from 'isbinaryfile';
-import jschardet from 'jschardet';
 import { logger } from '../../shared/logger.js';
+
+// Lazy-load jschardet and iconv-lite to avoid their combined ~19ms import cost.
+// They're only needed for non-UTF-8 files (~1% of source code), so the common
+// UTF-8 fast path never triggers the import.
+let _jschardet: { detect: (buffer: Buffer) => { encoding: string } | null } | undefined;
+let _iconv:
+  | {
+      decode: (buffer: Buffer, encoding: string, options?: object) => string;
+      encodingExists: (encoding: string) => boolean;
+    }
+  | undefined;
+const loadEncodingDeps = async () => {
+  if (!_jschardet || !_iconv) {
+    const [jschardetMod, iconvMod] = await Promise.all([import('jschardet'), import('iconv-lite')]);
+    _jschardet = jschardetMod.default ?? jschardetMod;
+    _iconv = (iconvMod as { default?: typeof _iconv }).default ?? iconvMod;
+  }
+  // biome-ignore lint/style/noNonNullAssertion: guaranteed assigned in the if-block above
+  return { jschardet: _jschardet!, iconv: _iconv! };
+};
 
 export type FileSkipReason = 'binary-extension' | 'binary-content' | 'size-limit' | 'encoding-error';
 
@@ -60,6 +78,7 @@ export const readRawFile = async (filePath: string, maxFileSize: number): Promis
     }
 
     // Slow path: Detect encoding with jschardet for non-UTF-8 files (e.g., Shift-JIS, EUC-KR)
+    const { jschardet, iconv } = await loadEncodingDeps();
     const { encoding: detectedEncoding } = jschardet.detect(buffer) ?? {};
     const encoding = detectedEncoding && iconv.encodingExists(detectedEncoding) ? detectedEncoding : 'utf-8';
     const content = iconv.decode(buffer, encoding, { stripBOM: true });

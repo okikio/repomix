@@ -1,7 +1,17 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
-import * as prompts from '@clack/prompts';
 import pc from 'picocolors';
+
+// Lazy-load @clack/prompts (~18ms import) since migration is rarely needed.
+// Most runs skip the migration entirely (no old "repopack" files exist).
+let _prompts: typeof import('@clack/prompts') | undefined;
+const loadPrompts = async () => {
+  if (!_prompts) {
+    _prompts = await import('@clack/prompts');
+  }
+  return _prompts;
+};
+
 import { getGlobalDirectory } from '../../config/globalDirectory.js';
 import { logger } from '../../shared/logger.js';
 
@@ -108,6 +118,7 @@ const migrateFile = async (
 
   const exists = await fileExists(newPath);
   if (exists) {
+    const prompts = await loadPrompts();
     const shouldOverwrite = await prompts.confirm({
       message: `${description} already exists at ${newPath}. Do you want to overwrite it?`,
     });
@@ -245,6 +256,7 @@ export const runMigrationAction = async (rootDir: string): Promise<MigrationResu
     migrationMessage += `${items.join(' and ')}. Would you like to migrate to ${pc.green('Repomix')}?`;
 
     // Confirm migration with user
+    const prompts = await loadPrompts();
     const shouldMigrate = await prompts.confirm({
       message: migrationMessage,
     });
