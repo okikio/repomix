@@ -125,7 +125,8 @@ describe('calculateMetrics', () => {
     expect(mockCalculateSelectiveFileMetrics).toHaveBeenCalled();
     // Verify file metrics started before output resolved
     expect(callOrder.indexOf('fileMetrics:start')).toBeLessThan(callOrder.indexOf('output:resolved'));
-    expect(result.totalTokens).toBe(15);
+    // Token count is now estimated from file token ratio (10 tokens / 100 chars * 14 output chars = 1)
+    expect(result.totalTokens).toBe(Math.round((10 / 100) * 'output content'.length));
     expect(result.totalCharacters).toBe('output content'.length);
   });
 
@@ -196,7 +197,7 @@ describe('calculateMetrics', () => {
     expect(result.totalTokens).toBe(52);
   });
 
-  it('should fall back to full output counting when tokenCountTree is disabled', async () => {
+  it('should estimate output tokens from top files when tokenCountTree is disabled', async () => {
     const processedFiles: ProcessedFile[] = [
       { path: 'file1.txt', content: 'a'.repeat(100) },
       { path: 'file2.txt', content: 'b'.repeat(200) },
@@ -204,6 +205,7 @@ describe('calculateMetrics', () => {
     const output = 'full output string';
     const progressCallback: RepomixProgressCallback = vi.fn();
 
+    // Only top file by size is counted (file2.txt)
     const fileMetrics = [{ path: 'file2.txt', charCount: 200, tokenCount: 20 }];
     (calculateSelectiveFileMetrics as unknown as Mock).mockResolvedValue(fileMetrics);
 
@@ -218,9 +220,10 @@ describe('calculateMetrics', () => {
       taskRunner: { run: vi.fn(), cleanup: vi.fn() },
     });
 
-    // Should use exact output token count, not estimation
-    expect(mockCalculateOutputMetrics).toHaveBeenCalled();
-    expect(result.totalTokens).toBe(42);
+    // Should estimate tokens from file ratio, not count full output
+    expect(mockCalculateOutputMetrics).not.toHaveBeenCalled();
+    // Estimation: 20 tokens / 200 chars * 18 output chars = 2
+    expect(result.totalTokens).toBe(Math.round((20 / 200) * output.length));
   });
 
   it('should handle empty files gracefully with tokenCountTree enabled', async () => {
