@@ -103,6 +103,20 @@ export const pack = async (
   );
   const warmupPromise = Promise.all(warmupPromises).then(() => 0); // Suppress unhandled rejection
 
+  // Start git operations early so they overlap with searchFiles and sort,
+  // completing before collectFiles begins. Previously, git ops ran in parallel
+  // with collectFiles, causing I/O contention between git subprocesses (diff,
+  // log, file change count queries) and the concurrent file reads. By starting
+  // them here, the git index is read while searchFiles is also reading it
+  // (both are git-based, benefiting from shared page cache), and they finish
+  // before the I/O-intensive file reading phase begins.
+  const gitDiffPromise = Promise.resolve(deps.getGitDiffs(rootDirs, config));
+  const gitLogPromise = Promise.resolve(deps.getGitLogs(rootDirs, config));
+  const prefetchPromise = Promise.resolve(deps.prefetchFileChangeCounts(config)).catch(() => {});
+  // Suppress unhandled rejection if searchFiles throws before these are awaited in the try block
+  gitDiffPromise.catch(() => {});
+  gitLogPromise.catch(() => {});
+
   progressCallback('Searching for files...');
   const searchResults = await withMemoryLogging('Search Files', async () =>
     Promise.all(
@@ -125,10 +139,10 @@ export const pack = async (
   }));
 
   try {
-    // Run file collection, git operations, and sort data prefetch in parallel since
-    // they are independent. Pre-fetching git file change counts here populates the
-    // module-level cache in outputSort.ts, so sortOutputFiles (called later during
-    // output generation) returns instantly from cache instead of spawning a git subprocess.
+    // Run file collection without git operations competing for I/O.
+    // Git diff/log/prefetch started above overlap with searchFiles + sort and are
+    // typically already resolved by the time collectFiles begins, eliminating the
+    // I/O contention that previously inflated file reading latency.
     progressCallback('Collecting files...');
     const [collectResults, gitDiffResult, gitLogResult] = await Promise.all([
       withMemoryLogging(
@@ -140,9 +154,9 @@ export const pack = async (
             ),
           ),
       ),
-      deps.getGitDiffs(rootDirs, config),
-      deps.getGitLogs(rootDirs, config),
-      deps.prefetchFileChangeCounts(config).catch(() => {}),
+      gitDiffPromise,
+      gitLogPromise,
+      prefetchPromise,
     ]);
 
     const rawFiles = collectResults.flatMap((curr) => curr.rawFiles);

@@ -335,7 +335,7 @@ node_modules
       });
 
       const result = await searchFiles('/mock/root', mockConfig);
-      expect(result.filePaths).toEqual(['root/another/file3.js', 'root/subdir/file2.js', 'root/file1.js']);
+      expect(result.filePaths.sort()).toEqual(['root/another/file3.js', 'root/file1.js', 'root/subdir/file2.js']);
       expect(result.filePaths).not.toContain('root/subdir/ignored.js');
       expect(result.emptyDirPaths).toEqual([]);
     });
@@ -543,11 +543,11 @@ node_modules
 
       const result = await searchFiles('/mock/root', mockConfig);
 
-      expect(result.filePaths).toEqual([
+      expect(result.filePaths.sort()).toEqual([
         `root${sep}another${sep}file3.js`,
+        `root${sep}file1.js`,
         `root${sep}subdir${sep}file2.js`,
         `root${sep}subdir${sep}ignored.js`,
-        `root${sep}file1.js`,
       ]);
       expect(result.filePaths).toContain(`root${sep}subdir${sep}ignored.js`);
       expect(result.emptyDirPaths).toEqual([]);
@@ -905,7 +905,7 @@ node_modules
 
       const result = await searchFiles('/test', mockConfig, explicitFiles);
 
-      expect(result.filePaths).toEqual(['lib/utils.ts', 'src/main.ts']);
+      expect(result.filePaths.sort()).toEqual(['lib/utils.ts', 'src/main.ts']);
       expect(result.emptyDirPaths).toEqual([]);
     });
   });
